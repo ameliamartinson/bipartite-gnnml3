@@ -19,7 +19,7 @@ gowalla_test = Path("datasets/gowalla/test.txt")
 yelp2018_train = Path("datasets/yelp2018/train.txt")
 yelp2018_test = Path("datasets/yelp2018/train.txt")
 
-def matrix_to_graph(B):
+def matrix_to_graph(B: sp.csr_matrix): # B scipy sparse matrix
     G = nx.Graph()
     B_coo = B.tocoo()
     M,N = B.shape
@@ -58,7 +58,7 @@ def load_bipartite_graph(txt_path):
 def numeric_id(node_name):
     return int(node_name.split("_", 1)[1])
 
-def biadjacency(G):
+def biadjacency(G: nx.Graph):
     users = sorted(
         [n for n, d in G.nodes(data=True) if d["node_type"] == "user"],
         key=numeric_id
@@ -70,7 +70,7 @@ def biadjacency(G):
     B = bipartite.biadjacency_matrix(G, row_order=users, column_order=items, dtype=np.float32)
     return B
 
-def normalized_biadjacency(G):
+def normalized_biadjacency(G: nx.Graph):
     B = biadjacency(G)
     row_sums = np.array(B.sum(axis=1).flatten())
     col_sums = np.array(B.sum(axis=0).flatten())
@@ -89,7 +89,14 @@ def normalized_biadjacency(G):
 
     return D_u_inv_sqrt @ B @ D_v_inv_sqrt
 
-B_test = sp.csr_matrix(([[1,0,1],[0,1,1]]))
-G = matrix_to_graph(B_test)
-print(normalized_biadjacency(G))
+def adjacency(G: nx.Graph):
+    B = biadjacency(G)
+    return sp.bmat([[None, B],[B.T, None]], format='csr')
+
+#B_test = sp.csr_matrix(([[1,0,1],[0,1,1]]))
+#G = matrix_to_graph(B_test)
+#print(normalized_biadjacency(G).todense())
+#
+#G = load_bipartite_graph(amazon_train)
+#print(B)
 
