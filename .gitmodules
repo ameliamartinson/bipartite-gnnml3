@@ -1,0 +1,3 @@
+[submodule "gnn-matlang"]
+	path = gnn-matlang
+	url = https://github.com/balcilar/gnn-matlang
