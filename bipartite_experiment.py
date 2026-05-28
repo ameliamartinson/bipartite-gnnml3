@@ -24,6 +24,17 @@ from libs.spect_conv import SpectConv, ML3Layer
 from bipartite_utils import BipartiteSpectralDesign
 
 
+def get_best_device():
+    """Auto-detect the best available device: CUDA > ROCm > MPS > CPU."""
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        return torch.device('cuda'), f"CUDA ({name})"
+    elif torch.backends.mps.is_available():
+        return torch.device('mps'), "MPS (Apple Silicon)"
+    else:
+        return torch.device('cpu'), "CPU"
+
+
 class GNNML3LinkPredictor(nn.Module):
     """GNNML3 for bipartite link prediction."""
     def __init__(self, ninp, ne, num_users, nout1=64, nout2=32, embed_dim=64):
@@ -102,8 +113,18 @@ def main():
     p.add_argument('--embed-dim', type=int, default=64)
     p.add_argument('--epochs', type=int, default=50)
     p.add_argument('--lr', type=float, default=0.001)
-    p.add_argument('--device', default='cpu')
+    p.add_argument('--device', default='auto',
+                   help="Device: 'auto' (detect), 'cuda', 'cpu', or specific device name")
+    p.add_argument('--amp', action='store_true',
+                   help='Enable automatic mixed precision (GPU only)')
     args = p.parse_args()
+
+    device, device_name = get_best_device()
+    if args.device != 'auto':
+        device = torch.device(args.device)
+        device_name = str(device)
+    use_amp = args.amp and device.type == 'cuda'
+    print(f"Device: {device_name}" + (" (AMP enabled)" if use_amp else ""))
 
     dd = f"datasets/{args.dataset}"
     nu = count_lines(f"{dd}/user_list.txt") - 1
@@ -138,11 +159,12 @@ def main():
 
     ne = data.edge_attr2.shape[1]
     model = GNNML3LinkPredictor(data.x.shape[1], ne, nu, embed_dim=args.embed_dim)
-    model = model.to(args.device)
-    data = data.to(args.device)
+    model = model.to(device)
+    data = data.to(device)
     print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    scaler = torch.amp.GradScaler() if use_amp else None
     all_items = list(range(ni))
     tr_users = sorted(tr_ui.keys())
     print(f"\nTraining {args.epochs} epochs...")
@@ -165,21 +187,31 @@ def main():
                 ul.append(u); pi.append(pos); ni_l.append(neg)
             if not ul: continue
             opt.zero_grad()
-            ue, ie = model(data)
-            pos_s = (ue[ul] * ie[pi]).sum(1)
-            neg_s = (ue[ul] * ie[ni_l]).sum(1)
-            loss = -F.logsigmoid(pos_s - neg_s).mean()
-            loss.backward()
-            opt.step()
+            if scaler is not None:
+                with torch.amp.autocast(device_type='cuda'):
+                    ue, ie = model(data)
+                    pos_s = (ue[ul] * ie[pi]).sum(1)
+                    neg_s = (ue[ul] * ie[ni_l]).sum(1)
+                    loss = -F.logsigmoid(pos_s - neg_s).mean()
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                ue, ie = model(data)
+                pos_s = (ue[ul] * ie[pi]).sum(1)
+                neg_s = (ue[ul] * ie[ni_l]).sum(1)
+                loss = -F.logsigmoid(pos_s - neg_s).mean()
+                loss.backward()
+                opt.step()
             tl += loss.item(); nb += 1
 
         if ep % 10 == 0 or ep == 1:
-            r20 = evaluate_recall(model, data, te_ui, tr_ui, k=20, device=args.device)
+            r20 = evaluate_recall(model, data, te_ui, tr_ui, k=20, device=device)
             print(f"  Epoch {ep:3d} | Loss: {tl/max(nb,1):.4f} | R@20: {r20:.4f}")
 
     print("\nFinal...")
-    r20 = evaluate_recall(model, data, te_ui, tr_ui, k=20, device=args.device)
-    r50 = evaluate_recall(model, data, te_ui, tr_ui, k=50, device=args.device)
+    r20 = evaluate_recall(model, data, te_ui, tr_ui, k=20, device=device)
+    r50 = evaluate_recall(model, data, te_ui, tr_ui, k=50, device=device)
     print(f"  Recall@20: {r20:.4f}  Recall@50: {r50:.4f}")
 
 
