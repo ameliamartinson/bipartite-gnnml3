@@ -81,28 +81,42 @@ class GNNML3LinkPredictor(nn.Module):
 
 @torch.no_grad()
 def evaluate_recall(
-    model, data, test_ui, train_ui, k=20, batch_size=1024, device="cpu"
+    model, data, test_ui, train_ui, ks=(20,), batch_size=1024, device="cpu"
 ):
+    """Mean per-user Recall@K (macro-averaged), matching the LightGCN-family
+    benchmark protocol these datasets come from.
+
+    Runs the graph convolution exactly once and derives every requested K from a
+    single top-max(K) ranking, so callers can get e.g. R@20 and R@50 together
+    without paying for repeated forward passes.
+
+    Returns a dict mapping each k in ``ks`` to its mean recall.
+    """
     model.eval()
     ue, ie = model(data)
     ue, ie = ue.cpu(), ie.cpu()
     nu = ue.shape[0]
-    hits = total = 0
+    ks = tuple(ks)
+    kmax = max(ks)
+    sums = {k: 0.0 for k in ks}
+    n_users = 0
     for s in range(0, nu, batch_size):
         e = min(s + batch_size, nu)
         scores = ue[s:e] @ ie.T
         for i, u in enumerate(range(s, e)):
             if u in train_ui:
                 scores[i, list(train_ui[u])] = -1e10
-        _, tk = torch.topk(scores, k, dim=1)
+        _, tk = torch.topk(scores, kmax, dim=1)
         for i, u in enumerate(range(s, e)):
-            if u in test_ui:
-                ts = test_ui[u]
-                if not ts:
-                    continue
-                total += len(ts)
-                hits += sum(1 for t in ts if t in tk[i].tolist())
-    return hits / max(total, 1)
+            ts = test_ui.get(u)
+            if not ts:
+                continue
+            n_users += 1
+            ranked = tk[i].tolist()
+            for k in ks:
+                hits = sum(1 for t in ranked[:k] if t in ts)
+                sums[k] += hits / len(ts)
+    return {k: sums[k] / max(n_users, 1) for k in ks}
 
 
 def load_edges(path):
@@ -211,6 +225,7 @@ def main():
     # their positive item tuples are cached for fast per-epoch sampling.
     valid_users = [u for u in sorted(tr_ui.keys()) if tr_ui[u]]
     pos_pool = [tuple(tr_ui[u]) for u in valid_users]
+    pos_sets = [tr_ui[u] for u in valid_users]
     ul_tensor = torch.tensor(valid_users, dtype=torch.long, device=device)
     nuv = len(valid_users)
     print(f"\nTraining {args.epochs} epochs (full-batch, {nuv:,} users)...")
@@ -219,10 +234,18 @@ def main():
         model.train()
 
         # One positive and one negative item per user for this epoch's BPR step.
+        # Negatives are rejection-sampled so they are never items the user has
+        # actually interacted with (no false negatives).
         pi_tensor = torch.tensor(
             [random.choice(p) for p in pos_pool], dtype=torch.long, device=device
         )
-        ni_tensor = torch.randint(0, ni, (nuv,), device=device)
+        neg = []
+        for ps in pos_sets:
+            j = random.randrange(ni)
+            while j in ps:
+                j = random.randrange(ni)
+            neg.append(j)
+        ni_tensor = torch.tensor(neg, dtype=torch.long, device=device)
 
         opt.zero_grad()
         if scaler is not None:
@@ -243,13 +266,12 @@ def main():
             opt.step()
 
         if ep % 10 == 0 or ep == 1:
-            r20 = evaluate_recall(model, data, te_ui, tr_ui, k=20, device=device)
-            print(f"  Epoch {ep:3d} | Loss: {loss.item():.4f} | R@20: {r20:.4f}")
+            rec = evaluate_recall(model, data, te_ui, tr_ui, ks=(20,), device=device)
+            print(f"  Epoch {ep:3d} | Loss: {loss.item():.4f} | R@20: {rec[20]:.4f}")
 
     print("\nFinal...")
-    r20 = evaluate_recall(model, data, te_ui, tr_ui, k=20, device=device)
-    r50 = evaluate_recall(model, data, te_ui, tr_ui, k=50, device=device)
-    print(f"  Recall@20: {r20:.4f}  Recall@50: {r50:.4f}")
+    rec = evaluate_recall(model, data, te_ui, tr_ui, ks=(20, 50), device=device)
+    print(f"  Recall@20: {rec[20]:.4f}  Recall@50: {rec[50]:.4f}")
 
 
 if __name__ == "__main__":
