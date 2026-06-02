@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import random
 import time
 import numpy as np
 import torch
@@ -19,7 +20,8 @@ import torch.nn.functional as F
 from torch_geometric.data import Data
 
 import sys
-sys.path.insert(0, 'gnn-matlang')
+
+sys.path.insert(0, "gnn-matlang")
 from libs.spect_conv import SpectConv, ML3Layer
 from bipartite_utils import BipartiteSpectralDesign
 
@@ -28,25 +30,44 @@ def get_best_device():
     """Auto-detect the best available device: CUDA > ROCm > MPS > CPU."""
     if torch.cuda.is_available():
         name = torch.cuda.get_device_name(0)
-        return torch.device('cuda'), f"CUDA ({name})"
+        return torch.device("cuda"), f"CUDA ({name})"
     elif torch.backends.mps.is_available():
-        return torch.device('mps'), "MPS (Apple Silicon)"
+        return torch.device("mps"), "MPS (Apple Silicon)"
     else:
-        return torch.device('cpu'), "CPU"
+        return torch.device("cpu"), "CPU"
 
 
 class GNNML3LinkPredictor(nn.Module):
     """GNNML3 for bipartite link prediction."""
+
     def __init__(self, ninp, ne, num_users, nout1=64, nout2=32, embed_dim=64):
         super().__init__()
         self.num_users = num_users
         nin = nout1 + nout2
-        self.conv1 = ML3Layer(learnedge=True, nedgeinput=ne, nedgeoutput=ne,
-                              ninp=ninp, nout1=nout1, nout2=nout2)
-        self.conv2 = ML3Layer(learnedge=True, nedgeinput=ne, nedgeoutput=ne,
-                              ninp=nin, nout1=nout1, nout2=nout2)
-        self.conv3 = ML3Layer(learnedge=True, nedgeinput=ne, nedgeoutput=ne,
-                              ninp=nin, nout1=nout1, nout2=nout2)
+        self.conv1 = ML3Layer(
+            learnedge=True,
+            nedgeinput=ne,
+            nedgeoutput=ne,
+            ninp=ninp,
+            nout1=nout1,
+            nout2=nout2,
+        )
+        self.conv2 = ML3Layer(
+            learnedge=True,
+            nedgeinput=ne,
+            nedgeoutput=ne,
+            ninp=nin,
+            nout1=nout1,
+            nout2=nout2,
+        )
+        self.conv3 = ML3Layer(
+            learnedge=True,
+            nedgeinput=ne,
+            nedgeoutput=ne,
+            ninp=nin,
+            nout1=nout1,
+            nout2=nout2,
+        )
         self.user_head = nn.Linear(nin, embed_dim)
         self.item_head = nn.Linear(nin, embed_dim)
 
@@ -55,11 +76,13 @@ class GNNML3LinkPredictor(nn.Module):
         x = self.conv1(x, ei, ea)
         x = self.conv2(x, ei, ea)
         x = self.conv3(x, ei, ea)
-        return self.user_head(x[:self.num_users]), self.item_head(x[self.num_users:])
+        return self.user_head(x[: self.num_users]), self.item_head(x[self.num_users :])
 
 
 @torch.no_grad()
-def evaluate_recall(model, data, test_ui, train_ui, k=20, batch_size=1024, device='cpu'):
+def evaluate_recall(
+    model, data, test_ui, train_ui, k=20, batch_size=1024, device="cpu"
+):
     model.eval()
     ue, ie = model(data)
     ue, ie = ue.cpu(), ie.cpu()
@@ -75,7 +98,8 @@ def evaluate_recall(model, data, test_ui, train_ui, k=20, batch_size=1024, devic
         for i, u in enumerate(range(s, e)):
             if u in test_ui:
                 ts = test_ui[u]
-                if not ts: continue
+                if not ts:
+                    continue
                 total += len(ts)
                 hits += sum(1 for t in ts if t in tk[i].tolist())
     return hits / max(total, 1)
@@ -87,7 +111,8 @@ def load_edges(path):
     with open(path) as f:
         for line in f:
             p = line.strip().split()
-            if not p: continue
+            if not p:
+                continue
             u = int(p[0])
             ui[u] = set()
             for it in p[1:]:
@@ -104,26 +129,31 @@ def count_lines(p):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--dataset', default='gowalla',
-                   choices=['amazon-book','gowalla','yelp2018'])
-    p.add_argument('--nfreq', type=int, default=5)
-    p.add_argument('--dv', type=float, default=5)
-    p.add_argument('--k', type=int, default=100)
-    p.add_argument('--recfield', type=int, default=1)
-    p.add_argument('--embed-dim', type=int, default=64)
-    p.add_argument('--epochs', type=int, default=50)
-    p.add_argument('--lr', type=float, default=0.001)
-    p.add_argument('--device', default='auto',
-                   help="Device: 'auto' (detect), 'cuda', 'cpu', or specific device name")
-    p.add_argument('--amp', action='store_true',
-                   help='Enable automatic mixed precision (GPU only)')
+    p.add_argument(
+        "--dataset", default="gowalla", choices=["amazon-book", "gowalla", "yelp2018"]
+    )
+    p.add_argument("--nfreq", type=int, default=5)
+    p.add_argument("--dv", type=float, default=5)
+    p.add_argument("--k", type=int, default=100)
+    p.add_argument("--recfield", type=int, default=1)
+    p.add_argument("--embed-dim", type=int, default=64)
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--lr", type=float, default=0.001)
+    p.add_argument(
+        "--device",
+        default="auto",
+        help="Device: 'auto' (detect), 'cuda', 'cpu', or specific device name",
+    )
+    p.add_argument(
+        "--amp", action="store_true", help="Enable automatic mixed precision (GPU only)"
+    )
     args = p.parse_args()
 
     device, device_name = get_best_device()
-    if args.device != 'auto':
+    if args.device != "auto":
         device = torch.device(args.device)
         device_name = str(device)
-    use_amp = args.amp and device.type == 'cuda'
+    use_amp = args.amp and device.type == "cuda"
     print(f"Device: {device_name}" + (" (AMP enabled)" if use_amp else ""))
 
     dd = f"datasets/{args.dataset}"
@@ -151,11 +181,20 @@ def main():
 
     print(f"Spectral design (nfreq={args.nfreq}, dv={args.dv}, k={args.k})...")
     t0 = time.time()
-    tf = BipartiteSpectralDesign(nu, nfreq=args.nfreq, dv=args.dv, k=args.k,
-                                  recfield=args.recfield, adddegree=True, nmax=0)
+    tf = BipartiteSpectralDesign(
+        nu,
+        nfreq=args.nfreq,
+        dv=args.dv,
+        k=args.k,
+        recfield=args.recfield,
+        adddegree=True,
+        nmax=0,
+    )
     data = tf(data)
     print(f"  Done in {time.time()-t0:.1f}s")
-    print(f"  edge_index2: {data.edge_index2.shape}, edge_attr2: {data.edge_attr2.shape}")
+    print(
+        f"  edge_index2: {data.edge_index2.shape}, edge_attr2: {data.edge_attr2.shape}"
+    )
 
     ne = data.edge_attr2.shape[1]
     model = GNNML3LinkPredictor(data.x.shape[1], ne, nu, embed_dim=args.embed_dim)
@@ -176,34 +215,41 @@ def main():
         for s in range(0, len(tr_users), 512):
             e = min(s + 512, len(tr_users))
             bu = [tr_users[i] for i in perm[s:e].tolist()]
-            ul, pi, ni_l = [], [], []
-            for u in bu:
-                pp = list(tr_ui[u])
-                if not pp: continue
-                pos = np.random.choice(pp)
-                neg = np.random.choice(all_items)
-                while neg in tr_ui[u]:
-                    neg = np.random.choice(all_items)
-                ul.append(u); pi.append(pos); ni_l.append(neg)
-            if not ul: continue
+
+            # 1. Filter users safely (drop users with 0 interactions)
+            valid_bu = [u for u in bu if tr_ui[u]]
+            if not valid_bu:
+                continue
+
+            # 2. Fast Positive Sampling
+            pi = [random.choice(tuple(tr_ui[u])) for u in valid_bu]
+
+            # 3. Vectorized Negative Sampling
+            ni_tensor = torch.randint(0, ni, (len(valid_bu),), device=device)
+
+            # 4. Convert the user and positive item lists directly to PyTorch tensors
+            ul_tensor = torch.tensor(valid_bu, dtype=torch.long, device=device)
+            pi_tensor = torch.tensor(pi, dtype=torch.long, device=device)
+
             opt.zero_grad()
             if scaler is not None:
-                with torch.amp.autocast(device_type='cuda'):
+                with torch.amp.autocast(device_type="cuda"):
                     ue, ie = model(data)
-                    pos_s = (ue[ul] * ie[pi]).sum(1)
-                    neg_s = (ue[ul] * ie[ni_l]).sum(1)
+                    pos_s = (ue[ul_tensor] * ie[pi_tensor]).sum(1)
+                    neg_s = (ue[ul_tensor] * ie[ni_tensor]).sum(1)
                     loss = -F.logsigmoid(pos_s - neg_s).mean()
                 scaler.scale(loss).backward()
                 scaler.step(opt)
                 scaler.update()
             else:
                 ue, ie = model(data)
-                pos_s = (ue[ul] * ie[pi]).sum(1)
-                neg_s = (ue[ul] * ie[ni_l]).sum(1)
+                pos_s = (ue[ul_tensor] * ie[pi_tensor]).sum(1)
+                neg_s = (ue[ul_tensor] * ie[ni_tensor]).sum(1)
                 loss = -F.logsigmoid(pos_s - neg_s).mean()
                 loss.backward()
                 opt.step()
-            tl += loss.item(); nb += 1
+            tl += loss.item()
+            nb += 1
 
         if ep % 10 == 0 or ep == 1:
             r20 = evaluate_recall(model, data, te_ui, tr_ui, k=20, device=device)
