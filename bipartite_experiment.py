@@ -204,56 +204,47 @@ def main():
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scaler = torch.amp.GradScaler() if use_amp else None
-    all_items = list(range(ni))
-    tr_users = sorted(tr_ui.keys())
-    print(f"\nTraining {args.epochs} epochs...")
+
+    # Full-batch training: the spectral convolution always processes the whole
+    # graph, so we run it exactly once per epoch instead of once per user
+    # minibatch. Users with no training interactions are dropped up front, and
+    # their positive item tuples are cached for fast per-epoch sampling.
+    valid_users = [u for u in sorted(tr_ui.keys()) if tr_ui[u]]
+    pos_pool = [tuple(tr_ui[u]) for u in valid_users]
+    ul_tensor = torch.tensor(valid_users, dtype=torch.long, device=device)
+    nuv = len(valid_users)
+    print(f"\nTraining {args.epochs} epochs (full-batch, {nuv:,} users)...")
 
     for ep in range(1, args.epochs + 1):
         model.train()
-        tl, nb = 0.0, 0
-        perm = torch.randperm(len(tr_users))
-        for s in range(0, len(tr_users), 512):
-            e = min(s + 512, len(tr_users))
-            bu = [tr_users[i] for i in perm[s:e].tolist()]
 
-            # 1. Filter users safely (drop users with 0 interactions)
-            valid_bu = [u for u in bu if tr_ui[u]]
-            if not valid_bu:
-                continue
+        # One positive and one negative item per user for this epoch's BPR step.
+        pi_tensor = torch.tensor(
+            [random.choice(p) for p in pos_pool], dtype=torch.long, device=device
+        )
+        ni_tensor = torch.randint(0, ni, (nuv,), device=device)
 
-            # 2. Fast Positive Sampling
-            pi = [random.choice(tuple(tr_ui[u])) for u in valid_bu]
-
-            # 3. Vectorized Negative Sampling
-            ni_tensor = torch.randint(0, ni, (len(valid_bu),), device=device)
-
-            # 4. Convert the user and positive item lists directly to PyTorch tensors
-            ul_tensor = torch.tensor(valid_bu, dtype=torch.long, device=device)
-            pi_tensor = torch.tensor(pi, dtype=torch.long, device=device)
-
-            opt.zero_grad()
-            if scaler is not None:
-                with torch.amp.autocast(device_type="cuda"):
-                    ue, ie = model(data)
-                    pos_s = (ue[ul_tensor] * ie[pi_tensor]).sum(1)
-                    neg_s = (ue[ul_tensor] * ie[ni_tensor]).sum(1)
-                    loss = -F.logsigmoid(pos_s - neg_s).mean()
-                scaler.scale(loss).backward()
-                scaler.step(opt)
-                scaler.update()
-            else:
+        opt.zero_grad()
+        if scaler is not None:
+            with torch.amp.autocast(device_type="cuda"):
                 ue, ie = model(data)
                 pos_s = (ue[ul_tensor] * ie[pi_tensor]).sum(1)
                 neg_s = (ue[ul_tensor] * ie[ni_tensor]).sum(1)
                 loss = -F.logsigmoid(pos_s - neg_s).mean()
-                loss.backward()
-                opt.step()
-            tl += loss.item()
-            nb += 1
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+        else:
+            ue, ie = model(data)
+            pos_s = (ue[ul_tensor] * ie[pi_tensor]).sum(1)
+            neg_s = (ue[ul_tensor] * ie[ni_tensor]).sum(1)
+            loss = -F.logsigmoid(pos_s - neg_s).mean()
+            loss.backward()
+            opt.step()
 
         if ep % 10 == 0 or ep == 1:
             r20 = evaluate_recall(model, data, te_ui, tr_ui, k=20, device=device)
-            print(f"  Epoch {ep:3d} | Loss: {tl/max(nb,1):.4f} | R@20: {r20:.4f}")
+            print(f"  Epoch {ep:3d} | Loss: {loss.item():.4f} | R@20: {r20:.4f}")
 
     print("\nFinal...")
     r20 = evaluate_recall(model, data, te_ui, tr_ui, k=20, device=device)
