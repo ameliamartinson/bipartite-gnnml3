@@ -92,6 +92,27 @@ def normalized_biadjacency(edge_index, num_users, num_items):
     return D_u_inv_sqrt @ B @ D_v_inv_sqrt
 
 
+def _svds_seeded(B, k, seed):
+    """Truncated SVD with a reproducible start vector.
+
+    scipy renamed the seeding kwarg over time (``random_state`` -> ``rng``); try
+    the modern name first and fall back gracefully so this works across versions.
+    """
+    if seed is None:
+        return sp.linalg.svds(B, k=k)
+    try:
+        return sp.linalg.svds(B, k=k, rng=seed)
+    except TypeError:
+        pass
+    try:
+        return sp.linalg.svds(B, k=k, random_state=seed)
+    except TypeError:
+        # Oldest scipy: pin a deterministic start vector manually.
+        rng = np.random.RandomState(seed)
+        v0 = rng.standard_normal(min(B.shape)).astype(np.float64)
+        return sp.linalg.svds(B, k=k, v0=v0)
+
+
 # ──────────────────────────────────────────────────────────────
 #  BipartiteSpectralDesign – the core pre-transform
 # ──────────────────────────────────────────────────────────────
@@ -114,10 +135,14 @@ class BipartiteSpectralDesign(object):
         adddegree: whether to append node degree as a feature.
         addadj: whether to append raw adjacency as an additional support.
         nmax: max nodes for PPGN (set 0 to skip PPGN tensors).
+        seed: seed for the truncated-SVD start vector (reproducibility). The
+              spectral features are bilinear in the singular vectors, so the
+              sign ambiguity cancels; only the iterative start vector needs
+              pinning.
     """
 
     def __init__(self, num_users, nfreq=5, dv=5, k=100, recfield=1,
-                 adddegree=True, addadj=False, nmax=0):
+                 adddegree=True, addadj=False, nmax=0, seed=None):
         self.num_users = num_users
         self.nfreq = nfreq
         self.dv = dv
@@ -126,6 +151,7 @@ class BipartiteSpectralDesign(object):
         self.adddegree = adddegree
         self.addadj = addadj
         self.nmax = nmax
+        self.seed = seed
 
     def __call__(self, data):
         n = data.x.shape[0]
@@ -164,7 +190,7 @@ class BipartiteSpectralDesign(object):
 
         # ── SVD of biadjacency ──────────────────────────────
         if self.k > 0 and self.k < min(num_users, num_items):
-            U, S, Vt = sp.linalg.svds(B, k=self.k)
+            U, S, Vt = _svds_seeded(B, self.k, self.seed)
             idx = np.argsort(S)[::-1]
             S = S[idx]
             U = U[:, idx]

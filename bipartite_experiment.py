@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import os
 import random
 import time
 import numpy as np
@@ -21,9 +22,24 @@ from torch_geometric.data import Data
 
 import sys
 
-sys.path.insert(0, "gnn-matlang")
+# Anchor imports/paths to this file's directory so the script works from any CWD.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "gnn-matlang"))
+sys.path.insert(0, _HERE)
 from libs.spect_conv import SpectConv, ML3Layer
 from bipartite_utils import BipartiteSpectralDesign
+from eval_common import score
+from bench_utils import append_jsonl
+
+
+def set_seed(seed):
+    """Seed every RNG that affects a run (init, sampling). The SVD start vector
+    is seeded separately inside BipartiteSpectralDesign."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def get_best_device():
@@ -80,43 +96,38 @@ class GNNML3LinkPredictor(nn.Module):
 
 
 @torch.no_grad()
-def evaluate_recall(
-    model, data, test_ui, train_ui, ks=(20,), batch_size=1024, device="cpu"
-):
-    """Mean per-user Recall@K (macro-averaged), matching the LightGCN-family
-    benchmark protocol these datasets come from.
+def evaluate(model, data, test_ui, train_ui, ks=(20,), batch_size=1024):
+    """Full-ranking evaluation mirroring LightGCN's ``Procedure.Test``.
 
-    Runs the graph convolution exactly once and derives every requested K from a
-    single top-max(K) ranking, so callers can get e.g. R@20 and R@50 together
-    without paying for repeated forward passes.
+    Ranks all items per test user, excludes training interactions, takes the
+    top-max(ks) items, and scores them with the shared ``eval_common`` module so
+    the metric math is byte-identical to LightGCN. Only users with a non-empty
+    held-out test set are scored (same as LightGCN keying on ``testDict``).
 
-    Returns a dict mapping each k in ``ks`` to its mean recall.
+    Returns a dict like ``{"recall@20": ..., "precision@20": ..., "ndcg@20": ...}``.
     """
     model.eval()
     ue, ie = model(data)
     ue, ie = ue.cpu(), ie.cpu()
     nu = ue.shape[0]
-    ks = tuple(ks)
     kmax = max(ks)
-    sums = {k: 0.0 for k in ks}
-    n_users = 0
+    ranked_topk = []
+    ground_truth = []
     for s in range(0, nu, batch_size):
         e = min(s + batch_size, nu)
+        rows = [(i, u) for i, u in enumerate(range(s, e)) if test_ui.get(u)]
+        if not rows:
+            continue
         scores = ue[s:e] @ ie.T
-        for i, u in enumerate(range(s, e)):
+        for i, u in rows:
             if u in train_ui:
                 scores[i, list(train_ui[u])] = -1e10
-        _, tk = torch.topk(scores, kmax, dim=1)
-        for i, u in enumerate(range(s, e)):
-            ts = test_ui.get(u)
-            if not ts:
-                continue
-            n_users += 1
-            ranked = tk[i].tolist()
-            for k in ks:
-                hits = sum(1 for t in ranked[:k] if t in ts)
-                sums[k] += hits / len(ts)
-    return {k: sums[k] / max(n_users, 1) for k in ks}
+        local_idx = [i for i, _ in rows]
+        _, tk = torch.topk(scores[local_idx], kmax, dim=1)
+        for pos, (_, u) in enumerate(rows):
+            ranked_topk.append(tk[pos].tolist())
+            ground_truth.append(test_ui[u])
+    return score(ranked_topk, ground_truth, ks=ks)
 
 
 def load_edges(path):
@@ -151,8 +162,28 @@ def main():
     p.add_argument("--k", type=int, default=100)
     p.add_argument("--recfield", type=int, default=1)
     p.add_argument("--embed-dim", type=int, default=64)
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--epochs", type=int, default=1000)
     p.add_argument("--lr", type=float, default=0.001)
+    p.add_argument(
+        "--decay",
+        type=float,
+        default=1e-4,
+        help="L2 weight decay (matched to LightGCN's --decay default)",
+    )
+    p.add_argument("--seed", type=int, default=2020, help="random seed (LightGCN uses 2020)")
+    p.add_argument(
+        "--topks",
+        default="[20]",
+        help="Python-literal list of cutoffs, e.g. '[20]' or '[20,50]'",
+    )
+    p.add_argument(
+        "--eval-every", type=int, default=10, help="evaluate on test every N epochs"
+    )
+    p.add_argument(
+        "--out",
+        default=os.path.join(_HERE, "results", "benchmark.jsonl"),
+        help="JSONL file to append the result record to",
+    )
     p.add_argument(
         "--device",
         default="auto",
@@ -163,14 +194,19 @@ def main():
     )
     args = p.parse_args()
 
+    ks = list(eval(args.topks))
+    primary_k = ks[0]
+    set_seed(args.seed)
+
     device, device_name = get_best_device()
     if args.device != "auto":
         device = torch.device(args.device)
         device_name = str(device)
     use_amp = args.amp and device.type == "cuda"
     print(f"Device: {device_name}" + (" (AMP enabled)" if use_amp else ""))
+    print(f"Seed: {args.seed}  topks: {ks}")
 
-    dd = f"datasets/{args.dataset}"
+    dd = os.path.join(_HERE, "datasets", args.dataset)
     nu = count_lines(f"{dd}/user_list.txt") - 1
     ni = count_lines(f"{dd}/item_list.txt") - 1
     print(f"Dataset: {args.dataset}")
@@ -203,9 +239,11 @@ def main():
         recfield=args.recfield,
         adddegree=True,
         nmax=0,
+        seed=args.seed,
     )
     data = tf(data)
-    print(f"  Done in {time.time()-t0:.1f}s")
+    setup_time_s = time.time() - t0
+    print(f"  Done in {setup_time_s:.1f}s")
     print(
         f"  edge_index2: {data.edge_index2.shape}, edge_attr2: {data.edge_attr2.shape}"
     )
@@ -214,9 +252,13 @@ def main():
     model = GNNML3LinkPredictor(data.x.shape[1], ne, nu, embed_dim=args.embed_dim)
     model = model.to(device)
     data = data.to(device)
-    print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
+    n_params = sum(p.numel() for p in model.parameters())
+    n_layers = sum(1 for m in model.modules() if isinstance(m, ML3Layer))
+    print(f"  Params: {n_params:,}")
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.decay)
     scaler = torch.amp.GradScaler() if use_amp else None
 
     # Full-batch training: the spectral convolution always processes the whole
@@ -229,6 +271,12 @@ def main():
     ul_tensor = torch.tensor(valid_users, dtype=torch.long, device=device)
     nuv = len(valid_users)
     print(f"\nTraining {args.epochs} epochs (full-batch, {nuv:,} users)...")
+
+    # Mirror LightGCN: evaluate on test periodically and report the best epoch.
+    best = None
+    best_epoch = 0
+    time_to_best_s = 0.0
+    train_start = time.time()
 
     for ep in range(1, args.epochs + 1):
         model.train()
@@ -265,13 +313,63 @@ def main():
             loss.backward()
             opt.step()
 
-        if ep % 10 == 0 or ep == 1:
-            rec = evaluate_recall(model, data, te_ui, tr_ui, ks=(20,), device=device)
-            print(f"  Epoch {ep:3d} | Loss: {loss.item():.4f} | R@20: {rec[20]:.4f}")
+        if ep % args.eval_every == 0 or ep == 1 or ep == args.epochs:
+            rec = evaluate(model, data, te_ui, tr_ui, ks=ks)
+            r_primary = rec[f"recall@{primary_k}"]
+            print(
+                f"  Epoch {ep:4d} | Loss: {loss.item():.4f} | "
+                f"R@{primary_k}: {r_primary:.4f}  N@{primary_k}: {rec[f'ndcg@{primary_k}']:.4f}"
+            )
+            if best is None or r_primary > best[f"recall@{primary_k}"]:
+                best = rec
+                best_epoch = ep
+                time_to_best_s = time.time() - train_start
 
-    print("\nFinal...")
-    rec = evaluate_recall(model, data, te_ui, tr_ui, ks=(20, 50), device=device)
-    print(f"  Recall@20: {rec[20]:.4f}  Recall@50: {rec[50]:.4f}")
+    train_time_s = time.time() - train_start
+    peak_mem_mb = (
+        torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        if device.type == "cuda"
+        else 0.0
+    )
+
+    print(f"\nBest epoch {best_epoch} (selected by recall@{primary_k}):")
+    for k in ks:
+        print(
+            f"  Recall@{k}: {best[f'recall@{k}']:.4f}  "
+            f"NDCG@{k}: {best[f'ndcg@{k}']:.4f}  "
+            f"Precision@{k}: {best[f'precision@{k}']:.4f}"
+        )
+
+    row = {
+        "model": "gnnml3",
+        "dataset": args.dataset,
+        "seed": args.seed,
+        "epochs": args.epochs,
+        "embed_dim": args.embed_dim,
+        "layers": n_layers,
+        "lr": args.lr,
+        "decay": args.decay,
+        "device": device_name,
+        "best_epoch": best_epoch,
+        "setup_time_s": round(setup_time_s, 3),
+        "train_time_s": round(train_time_s, 3),
+        "time_to_best_s": round(time_to_best_s, 3),
+        "peak_mem_mb": round(peak_mem_mb, 1),
+        "n_params": int(n_params),
+        # model-specific spectral-design hyperparameters
+        "nfreq": args.nfreq,
+        "dv": args.dv,
+        "k_svd": args.k,
+        "recfield": args.recfield,
+        "amp": bool(use_amp),
+    }
+    for k in ks:
+        row[f"recall@{k}"] = round(best[f"recall@{k}"], 6)
+        row[f"ndcg@{k}"] = round(best[f"ndcg@{k}"], 6)
+        row[f"precision@{k}"] = round(best[f"precision@{k}"], 6)
+
+    append_jsonl(args.out, row)
+    print(f"\nResult appended to {args.out}")
 
 
 if __name__ == "__main__":

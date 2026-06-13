@@ -1,3 +1,6 @@
 [submodule "gnn-matlang"]
 	path = gnn-matlang
 	url = https://github.com/balcilar/gnn-matlang
+[submodule "LightGCN-PyTorch"]
+	path = LightGCN-PyTorch
+	url = https://github.com/gusye1234/LightGCN-PyTorch.git
