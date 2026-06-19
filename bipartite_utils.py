@@ -40,9 +40,9 @@ def g(x, b=5, f_s=1):
     return 0.5 * (phi(x, b, f_s) - phi(-x, b, f_s))
 
 
-def normalized_biadjacency(edge_index, num_users, num_items):
+def normalized_biadjacency(edge_index, num_users, num_items, normalize=True):
     """
-    Build the row-and-column-normalized biadjacency matrix from edge_index.
+    Build the biadjacency matrix from edge_index, optionally normalized.
 
     Args:
         edge_index: torch.Tensor of shape (2, num_edges), undirected edges
@@ -50,10 +50,12 @@ def normalized_biadjacency(edge_index, num_users, num_items):
                     have ids num_users..num_users+num_items-1.
         num_users: number of user nodes
         num_items: number of item nodes
+        normalize: if True (default), return the symmetrically normalized
+                   biadjacency D_u^{-1/2} @ B @ D_v^{-1/2}; if False, return the
+                   raw binary biadjacency B.
 
     Returns:
-        scipy.sparse.csr_matrix of shape (num_users, num_items),
-        D_u^{-1/2} @ B @ D_v^{-1/2}.
+        scipy.sparse.csr_matrix of shape (num_users, num_items).
     """
     src = edge_index[0].numpy()
     dst = edge_index[1].numpy()
@@ -76,6 +78,9 @@ def normalized_biadjacency(edge_index, num_users, num_items):
                        (all_u, all_i)), shape=(num_users, num_items))
     # Deduplicate
     B.data = np.ones_like(B.data, dtype=np.float32)
+
+    if not normalize:
+        return B
 
     # Normalize: D_u^{-1/2} @ B @ D_v^{-1/2}
     row_sums = np.array(B.sum(axis=1)).flatten()
@@ -139,10 +144,14 @@ class BipartiteSpectralDesign(object):
               spectral features are bilinear in the singular vectors, so the
               sign ambiguity cancels; only the iterative start vector needs
               pinning.
+        normalize_biadj: if True (default), SVD the symmetrically normalized
+              biadjacency D_u^{-1/2} B D_v^{-1/2}; if False, SVD the raw binary
+              biadjacency B instead.
     """
 
     def __init__(self, num_users, nfreq=5, dv=5, k=100, recfield=1,
-                 adddegree=True, addadj=False, nmax=0, seed=None):
+                 adddegree=True, addadj=False, nmax=0, seed=None,
+                 normalize_biadj=True):
         self.num_users = num_users
         self.nfreq = nfreq
         self.dv = dv
@@ -152,6 +161,7 @@ class BipartiteSpectralDesign(object):
         self.addadj = addadj
         self.nmax = nmax
         self.seed = seed
+        self.normalize_biadj = normalize_biadj
 
     def __call__(self, data):
         n = data.x.shape[0]
@@ -185,8 +195,9 @@ class BipartiteSpectralDesign(object):
             for _ in range(1, self.recfield):
                 M_sp = (M_sp @ M_sp).astype(bool).astype(np.float32)
 
-        # ── build normalized biadjacency B ──────────────────
-        B = normalized_biadjacency(data.edge_index, num_users, num_items)
+        # ── build (optionally normalized) biadjacency B ─────
+        B = normalized_biadjacency(data.edge_index, num_users, num_items,
+                                   normalize=self.normalize_biadj)
 
         # ── SVD of biadjacency ──────────────────────────────
         if self.k > 0 and self.k < min(num_users, num_items):

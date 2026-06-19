@@ -161,6 +161,12 @@ def main():
     p.add_argument("--dv", type=float, default=5)
     p.add_argument("--k", type=int, default=100)
     p.add_argument("--recfield", type=int, default=1)
+    p.add_argument(
+        "--raw-biadj",
+        action="store_true",
+        help="SVD the raw binary biadjacency instead of the symmetrically "
+        "normalized one (D_u^-1/2 B D_v^-1/2)",
+    )
     p.add_argument("--embed-dim", type=int, default=64)
     p.add_argument("--epochs", type=int, default=1000)
     p.add_argument("--lr", type=float, default=0.001)
@@ -229,7 +235,11 @@ def main():
     x[nu:, 1] = 1.0
     data = Data(edge_index=ei, x=x, y=torch.tensor([0]))
 
-    print(f"Spectral design (nfreq={args.nfreq}, dv={args.dv}, k={args.k})...")
+    biadj_kind = "raw" if args.raw_biadj else "normalized"
+    print(
+        f"Spectral design (nfreq={args.nfreq}, dv={args.dv}, k={args.k}, "
+        f"biadj={biadj_kind})..."
+    )
     t0 = time.time()
     tf = BipartiteSpectralDesign(
         nu,
@@ -240,6 +250,7 @@ def main():
         adddegree=True,
         nmax=0,
         seed=args.seed,
+        normalize_biadj=not args.raw_biadj,
     )
     data = tf(data)
     setup_time_s = time.time() - t0
@@ -361,6 +372,7 @@ def main():
         "dv": args.dv,
         "k_svd": args.k,
         "recfield": args.recfield,
+        "biadj": biadj_kind,
         "amp": bool(use_amp),
     }
     for k in ks:

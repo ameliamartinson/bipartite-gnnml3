@@ -35,7 +35,7 @@ def _parse_list(s):
 def build_cmd(model, dataset, seed, args):
     py = sys.executable
     if model == "gnnml3":
-        return [
+        cmd = [
             py, os.path.join(_HERE, "bipartite_experiment.py"),
             "--dataset", dataset,
             "--seed", str(seed),
@@ -51,6 +51,9 @@ def build_cmd(model, dataset, seed, args):
             "--k", str(args.k),
             "--recfield", str(args.recfield),
         ]
+        if args.raw_biadj:
+            cmd.append("--raw-biadj")
+        return cmd
     elif model == "lightgcn":
         return [
             py, os.path.join(_HERE, "run_lightgcn.py"),
@@ -148,6 +151,11 @@ def main():
     ap.add_argument("--dv", type=float, default=5)
     ap.add_argument("--k", type=int, default=100)
     ap.add_argument("--recfield", type=int, default=1)
+    ap.add_argument(
+        "--raw-biadj",
+        action="store_true",
+        help="gnnml3 only: SVD the raw (unnormalized) biadjacency",
+    )
     ap.add_argument("--skip-run", action="store_true", help="only aggregate existing results")
     args = ap.parse_args()
 
