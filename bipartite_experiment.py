@@ -54,45 +54,72 @@ def get_best_device():
 
 
 class GNNML3LinkPredictor(nn.Module):
-    """GNNML3 for bipartite link prediction."""
+    """GNNML3 for bipartite link prediction.
 
-    def __init__(self, ninp, ne, num_users, nout1=64, nout2=32, embed_dim=64):
+    Optionally prepends a learnable per-node embedding table (collaborative-
+    filtering style, like LightGCN/MF) to the spectral-convolution input, which
+    gives the model the per-node capacity that pure structural features lack.
+    Supports a configurable number of ML3 layers and an optional LightGCN-style
+    averaging of layer outputs (jumping-knowledge mean) to curb over-smoothing.
+
+    Args:
+        ninp: width of the structural input features in ``data.x``.
+        ne: number of edge supports (nfreq + 1).
+        num_users: number of user nodes (rows 0..num_users-1).
+        num_nodes: total nodes (users + items); needed for the embedding table.
+        emb_in: learnable node-embedding dim. 0 disables embeddings (the model
+                then runs on structural features only, the original behavior).
+        n_layers: number of stacked ML3 spectral layers.
+        use_struct_feats: when embeddings are on, also concatenate the structural
+                features; ignored (forced True) when emb_in == 0.
+        layer_combine: average all layer outputs instead of using just the last.
+    """
+
+    def __init__(self, ninp, ne, num_users, num_nodes=0, emb_in=0, n_layers=3,
+                 nout1=64, nout2=32, embed_dim=64, use_struct_feats=True,
+                 layer_combine=False):
         super().__init__()
         self.num_users = num_users
+        self.emb_in = emb_in
+        self.use_struct_feats = use_struct_feats or emb_in == 0
+        self.layer_combine = layer_combine
+
+        if emb_in > 0:
+            self.node_emb = nn.Embedding(num_nodes, emb_in)
+            nn.init.normal_(self.node_emb.weight, std=0.1)
+        else:
+            self.node_emb = None
+
+        conv_in = (emb_in if emb_in > 0 else 0) + (ninp if self.use_struct_feats else 0)
         nin = nout1 + nout2
-        self.conv1 = ML3Layer(
-            learnedge=True,
-            nedgeinput=ne,
-            nedgeoutput=ne,
-            ninp=ninp,
-            nout1=nout1,
-            nout2=nout2,
-        )
-        self.conv2 = ML3Layer(
-            learnedge=True,
-            nedgeinput=ne,
-            nedgeoutput=ne,
-            ninp=nin,
-            nout1=nout1,
-            nout2=nout2,
-        )
-        self.conv3 = ML3Layer(
-            learnedge=True,
-            nedgeinput=ne,
-            nedgeoutput=ne,
-            ninp=nin,
-            nout1=nout1,
-            nout2=nout2,
+        self.convs = nn.ModuleList(
+            ML3Layer(
+                learnedge=True,
+                nedgeinput=ne,
+                nedgeoutput=ne,
+                ninp=conv_in if li == 0 else nin,
+                nout1=nout1,
+                nout2=nout2,
+            )
+            for li in range(n_layers)
         )
         self.user_head = nn.Linear(nin, embed_dim)
         self.item_head = nn.Linear(nin, embed_dim)
 
     def forward(self, data):
-        x, ei, ea = data.x, data.edge_index2, data.edge_attr2
-        x = self.conv1(x, ei, ea)
-        x = self.conv2(x, ei, ea)
-        x = self.conv3(x, ei, ea)
-        return self.user_head(x[: self.num_users]), self.item_head(x[self.num_users :])
+        ei, ea = data.edge_index2, data.edge_attr2
+        if self.node_emb is not None:
+            x = self.node_emb.weight
+            if self.use_struct_feats:
+                x = torch.cat([x, data.x], dim=1)
+        else:
+            x = data.x
+        outs = []
+        for conv in self.convs:
+            x = conv(x, ei, ea)
+            outs.append(x)
+        h = torch.stack(outs, dim=0).mean(0) if self.layer_combine else outs[-1]
+        return self.user_head(h[: self.num_users]), self.item_head(h[self.num_users :])
 
 
 @torch.no_grad()
@@ -168,6 +195,37 @@ def main():
         "normalized one (D_u^-1/2 B D_v^-1/2)",
     )
     p.add_argument("--embed-dim", type=int, default=64)
+    p.add_argument(
+        "--emb-in",
+        type=int,
+        default=0,
+        help="learnable node-embedding dim fed to the convs (0 = off, use only "
+        "structural indicator/degree features; >0 enables CF-style embeddings)",
+    )
+    p.add_argument(
+        "--layers", type=int, default=3, help="number of stacked ML3 spectral layers"
+    )
+    p.add_argument(
+        "--no-struct-feats",
+        action="store_true",
+        help="when --emb-in>0, drop the structural features and feed the convs "
+        "only the learnable embeddings",
+    )
+    p.add_argument(
+        "--layer-combine",
+        action="store_true",
+        help="average all layer outputs (LightGCN-style jumping-knowledge mean) "
+        "instead of using only the last layer's output",
+    )
+    p.add_argument(
+        "--bpr-batch",
+        type=int,
+        default=0,
+        help="0 = one full-graph forward per epoch with a BPR loss over ALL "
+        "training interactions (cheap, recommended); >0 = LightGCN-style "
+        "minibatched BPR with a full-graph forward per minibatch of this size "
+        "(many more gradient steps, but much slower for GNNML3)",
+    )
     p.add_argument("--epochs", type=int, default=1000)
     p.add_argument("--lr", type=float, default=0.001)
     p.add_argument(
@@ -260,11 +318,34 @@ def main():
     )
 
     ne = data.edge_attr2.shape[1]
-    model = GNNML3LinkPredictor(data.x.shape[1], ne, nu, embed_dim=args.embed_dim)
+    use_struct_feats = not args.no_struct_feats
+    model = GNNML3LinkPredictor(
+        data.x.shape[1],
+        ne,
+        nu,
+        num_nodes=data.x.shape[0],
+        emb_in=args.emb_in,
+        n_layers=args.layers,
+        embed_dim=args.embed_dim,
+        use_struct_feats=use_struct_feats,
+        layer_combine=args.layer_combine,
+    )
     model = model.to(device)
     data = data.to(device)
     n_params = sum(p.numel() for p in model.parameters())
     n_layers = sum(1 for m in model.modules() if isinstance(m, ML3Layer))
+    feat_desc = []
+    if args.emb_in > 0:
+        feat_desc.append(f"emb_in={args.emb_in}")
+        if model.use_struct_feats:
+            feat_desc.append("+struct")
+    else:
+        feat_desc.append("struct-only")
+    print(
+        f"  Model: {n_layers} layers, "
+        f"{'mean' if args.layer_combine else 'last'}-layer readout, "
+        f"input=[{', '.join(feat_desc)}]"
+    )
     print(f"  Params: {n_params:,}")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -272,16 +353,40 @@ def main():
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.decay)
     scaler = torch.amp.GradScaler() if use_amp else None
 
-    # Full-batch training: the spectral convolution always processes the whole
-    # graph, so we run it exactly once per epoch instead of once per user
-    # minibatch. Users with no training interactions are dropped up front, and
-    # their positive item tuples are cached for fast per-epoch sampling.
-    valid_users = [u for u in sorted(tr_ui.keys()) if tr_ui[u]]
-    pos_pool = [tuple(tr_ui[u]) for u in valid_users]
-    pos_sets = [tr_ui[u] for u in valid_users]
-    ul_tensor = torch.tensor(valid_users, dtype=torch.long, device=device)
-    nuv = len(valid_users)
-    print(f"\nTraining {args.epochs} epochs (full-batch, {nuv:,} users)...")
+    # All training interactions as parallel (user, positive-item) tensors. Each
+    # epoch samples one negative item per interaction. Negatives are drawn with a
+    # vectorized randint without per-edge rejection: at these densities (~1e-3)
+    # the false-negative rate is negligible and BPR tolerates it, so we keep the
+    # sampler GPU-friendly instead of looping in Python.
+    inter_u = torch.tensor([u for u, _ in tr_e], dtype=torch.long, device=device)
+    inter_i = torch.tensor([i for _, i in tr_e], dtype=torch.long, device=device)
+    n_inter = inter_u.shape[0]
+
+    def compute_loss(u_idx, pos_idx, neg_idx):
+        ue, ie = model(data)
+        pos_s = (ue[u_idx] * ie[pos_idx]).sum(1)
+        neg_s = (ue[u_idx] * ie[neg_idx]).sum(1)
+        return -F.logsigmoid(pos_s - neg_s).mean()
+
+    def optimize(u_idx, pos_idx, neg_idx):
+        opt.zero_grad()
+        if scaler is not None:
+            with torch.amp.autocast(device_type="cuda"):
+                loss = compute_loss(u_idx, pos_idx, neg_idx)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss = compute_loss(u_idx, pos_idx, neg_idx)
+            loss.backward()
+            opt.step()
+        return loss.item()
+
+    if args.bpr_batch > 0:
+        mode_desc = f"minibatch BPR (bsz={args.bpr_batch})"
+    else:
+        mode_desc = "full-batch (all interactions / epoch)"
+    print(f"\nTraining {args.epochs} epochs, {mode_desc}, {n_inter:,} interactions...")
 
     # Mirror LightGCN: evaluate on test periodically and report the best epoch.
     best = None
@@ -291,44 +396,23 @@ def main():
 
     for ep in range(1, args.epochs + 1):
         model.train()
+        neg = torch.randint(0, ni, (n_inter,), dtype=torch.long, device=device)
 
-        # One positive and one negative item per user for this epoch's BPR step.
-        # Negatives are rejection-sampled so they are never items the user has
-        # actually interacted with (no false negatives).
-        pi_tensor = torch.tensor(
-            [random.choice(p) for p in pos_pool], dtype=torch.long, device=device
-        )
-        neg = []
-        for ps in pos_sets:
-            j = random.randrange(ni)
-            while j in ps:
-                j = random.randrange(ni)
-            neg.append(j)
-        ni_tensor = torch.tensor(neg, dtype=torch.long, device=device)
-
-        opt.zero_grad()
-        if scaler is not None:
-            with torch.amp.autocast(device_type="cuda"):
-                ue, ie = model(data)
-                pos_s = (ue[ul_tensor] * ie[pi_tensor]).sum(1)
-                neg_s = (ue[ul_tensor] * ie[ni_tensor]).sum(1)
-                loss = -F.logsigmoid(pos_s - neg_s).mean()
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
+        if args.bpr_batch > 0:
+            perm = torch.randperm(n_inter, device=device)
+            losses = []
+            for s in range(0, n_inter, args.bpr_batch):
+                idx = perm[s : s + args.bpr_batch]
+                losses.append(optimize(inter_u[idx], inter_i[idx], neg[idx]))
+            loss_val = sum(losses) / max(len(losses), 1)
         else:
-            ue, ie = model(data)
-            pos_s = (ue[ul_tensor] * ie[pi_tensor]).sum(1)
-            neg_s = (ue[ul_tensor] * ie[ni_tensor]).sum(1)
-            loss = -F.logsigmoid(pos_s - neg_s).mean()
-            loss.backward()
-            opt.step()
+            loss_val = optimize(inter_u, inter_i, neg)
 
         if ep % args.eval_every == 0 or ep == 1 or ep == args.epochs:
             rec = evaluate(model, data, te_ui, tr_ui, ks=ks)
             r_primary = rec[f"recall@{primary_k}"]
             print(
-                f"  Epoch {ep:4d} | Loss: {loss.item():.4f} | "
+                f"  Epoch {ep:4d} | Loss: {loss_val:.4f} | "
                 f"R@{primary_k}: {r_primary:.4f}  N@{primary_k}: {rec[f'ndcg@{primary_k}']:.4f}"
             )
             if best is None or r_primary > best[f"recall@{primary_k}"]:
@@ -357,6 +441,10 @@ def main():
         "seed": args.seed,
         "epochs": args.epochs,
         "embed_dim": args.embed_dim,
+        "emb_in": args.emb_in,
+        "struct_feats": bool(model.use_struct_feats),
+        "layer_combine": bool(args.layer_combine),
+        "bpr_batch": args.bpr_batch,
         "layers": n_layers,
         "lr": args.lr,
         "decay": args.decay,

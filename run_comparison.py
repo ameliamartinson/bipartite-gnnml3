@@ -46,6 +46,9 @@ def build_cmd(model, dataset, seed, args):
             "--topks", args.topks,
             "--out", args.out,
             "--device", args.device,
+            "--layers", str(args.layers),
+            "--emb-in", str(args.emb_in),
+            "--bpr-batch", str(args.bpr_batch),
             "--nfreq", str(args.nfreq),
             "--dv", str(args.dv),
             "--k", str(args.k),
@@ -53,6 +56,10 @@ def build_cmd(model, dataset, seed, args):
         ]
         if args.raw_biadj:
             cmd.append("--raw-biadj")
+        if args.no_struct_feats:
+            cmd.append("--no-struct-feats")
+        if args.layer_combine:
+            cmd.append("--layer-combine")
         return cmd
     elif model == "lightgcn":
         return [
@@ -140,7 +147,12 @@ def main():
     ap.add_argument("--seeds", default="[2020]")
     ap.add_argument("--epochs", type=int, default=1000)
     ap.add_argument("--embed-dim", type=int, default=64)
-    ap.add_argument("--layers", type=int, default=3, help="LightGCN propagation layers")
+    ap.add_argument(
+        "--layers",
+        type=int,
+        default=3,
+        help="propagation/spectral layers (LightGCN --layer and gnnml3 --layers)",
+    )
     ap.add_argument("--lr", type=float, default=0.001)
     ap.add_argument("--decay", type=float, default=1e-4)
     ap.add_argument("--topks", default="[20]")
@@ -155,6 +167,28 @@ def main():
         "--raw-biadj",
         action="store_true",
         help="gnnml3 only: SVD the raw (unnormalized) biadjacency",
+    )
+    ap.add_argument(
+        "--emb-in",
+        type=int,
+        default=0,
+        help="gnnml3 only: learnable node-embedding dim (0 = structural feats only)",
+    )
+    ap.add_argument(
+        "--bpr-batch",
+        type=int,
+        default=0,
+        help="gnnml3 only: 0 = all-interactions/epoch; >0 = minibatched BPR",
+    )
+    ap.add_argument(
+        "--no-struct-feats",
+        action="store_true",
+        help="gnnml3 only: with --emb-in>0, use embeddings only (drop struct feats)",
+    )
+    ap.add_argument(
+        "--layer-combine",
+        action="store_true",
+        help="gnnml3 only: average layer outputs (LightGCN-style readout)",
     )
     ap.add_argument("--skip-run", action="store_true", help="only aggregate existing results")
     args = ap.parse_args()
