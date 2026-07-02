@@ -194,6 +194,15 @@ def main():
         help="SVD the raw binary biadjacency instead of the symmetrically "
         "normalized one (D_u^-1/2 B D_v^-1/2)",
     )
+    p.add_argument(
+        "--uu-topk",
+        type=int,
+        default=0,
+        help="add sparsified user-user/item-item co-interaction edges to the "
+        "receptive field: keep the N strongest co-occurrence neighbors per "
+        "node (0 = off). Gives the even spectral filters real within-partition "
+        "edges without the dense 2-hop memory blow-up",
+    )
     p.add_argument("--embed-dim", type=int, default=64)
     p.add_argument(
         "--emb-in",
@@ -296,7 +305,7 @@ def main():
     biadj_kind = "raw" if args.raw_biadj else "normalized"
     print(
         f"Spectral design (nfreq={args.nfreq}, dv={args.dv}, k={args.k}, "
-        f"biadj={biadj_kind})..."
+        f"biadj={biadj_kind}, uu_topk={args.uu_topk})..."
     )
     t0 = time.time()
     tf = BipartiteSpectralDesign(
@@ -309,6 +318,7 @@ def main():
         nmax=0,
         seed=args.seed,
         normalize_biadj=not args.raw_biadj,
+        uu_topk=args.uu_topk,
     )
     data = tf(data)
     setup_time_s = time.time() - t0
@@ -460,6 +470,7 @@ def main():
         "dv": args.dv,
         "k_svd": args.k,
         "recfield": args.recfield,
+        "uu_topk": args.uu_topk,
         "biadj": biadj_kind,
         "amp": bool(use_amp),
     }

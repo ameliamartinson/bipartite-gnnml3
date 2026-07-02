@@ -53,6 +53,7 @@ def build_cmd(model, dataset, seed, args):
             "--dv", str(args.dv),
             "--k", str(args.k),
             "--recfield", str(args.recfield),
+            "--uu-topk", str(args.uu_topk),
         ]
         if args.raw_biadj:
             cmd.append("--raw-biadj")
@@ -163,6 +164,12 @@ def main():
     ap.add_argument("--dv", type=float, default=5)
     ap.add_argument("--k", type=int, default=100)
     ap.add_argument("--recfield", type=int, default=1)
+    ap.add_argument(
+        "--uu-topk",
+        type=int,
+        default=0,
+        help="gnnml3 only: top-N sparsified co-interaction edges per node (0 = off)",
+    )
     ap.add_argument(
         "--raw-biadj",
         action="store_true",

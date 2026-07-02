@@ -97,6 +97,56 @@ def normalized_biadjacency(edge_index, num_users, num_items, normalize=True):
     return D_u_inv_sqrt @ B @ D_v_inv_sqrt
 
 
+def topk_cooccurrence(B, topk, block_size=2048):
+    """Sparsified co-occurrence graph: top-``topk`` rows of ``B @ B.T``.
+
+    Computes the (row-side) co-interaction graph of a biadjacency matrix in
+    row blocks so the full product is never materialized at once, keeping only
+    the ``topk`` strongest neighbors per row (diagonal excluded; the identity
+    support covers self-loops separately). Pass the *normalized* biadjacency so
+    the weights down-rank promiscuous columns instead of raw co-counts.
+
+    The result is symmetrized with an element-wise max, so an edge survives if
+    either endpoint ranks the other in its top-``topk``.
+
+    Args:
+        B: scipy sparse matrix (num_rows x num_cols); rows are the partition
+           the co-occurrence graph is built over.
+        topk: neighbors kept per row (before symmetrization).
+        block_size: rows per spgemm block (bounds peak memory).
+
+    Returns:
+        scipy.sparse.csr_matrix of shape (num_rows, num_rows).
+    """
+    B = B.tocsr()
+    m = B.shape[0]
+    Bt = B.T.tocsr()
+    rows_out, cols_out, vals_out = [], [], []
+    for s in range(0, m, block_size):
+        blk = (B[s : s + block_size] @ Bt).tocsr()
+        for i in range(blk.shape[0]):
+            lo, hi = blk.indptr[i], blk.indptr[i + 1]
+            c = blk.indices[lo:hi]
+            v = blk.data[lo:hi]
+            keep = c != (s + i)  # drop the self-loop
+            c, v = c[keep], v[keep]
+            if len(v) > topk:
+                sel = np.argpartition(v, -topk)[-topk:]
+                c, v = c[sel], v[sel]
+            if len(c):
+                rows_out.append(np.full(len(c), s + i, dtype=np.int64))
+                cols_out.append(c.astype(np.int64))
+                vals_out.append(v.astype(np.float32))
+    if not rows_out:
+        return sp.csr_matrix((m, m), dtype=np.float32)
+    G = sp.csr_matrix(
+        (np.concatenate(vals_out),
+         (np.concatenate(rows_out), np.concatenate(cols_out))),
+        shape=(m, m),
+    )
+    return G.maximum(G.T).tocsr()
+
+
 def _svds_seeded(B, k, seed):
     """Truncated SVD with a reproducible start vector.
 
@@ -147,11 +197,18 @@ class BipartiteSpectralDesign(object):
         normalize_biadj: if True (default), SVD the symmetrically normalized
               biadjacency D_u^{-1/2} B D_v^{-1/2}; if False, SVD the raw binary
               biadjacency B instead.
+        uu_topk: if > 0, augment the receptive-field mask with sparsified
+              within-partition co-interaction edges: for each user (item), the
+              uu_topk strongest neighbors of the normalized co-occurrence graph
+              B_hat @ B_hat.T (B_hat.T @ B_hat). This gives the even spectral
+              filters real user-user/item-item edges to act on -- the effect of
+              recfield=2 -- while keeping the mask ~topk edges/node instead of
+              the dense 2-hop blow-up (~1000+ edges/node on these datasets).
     """
 
     def __init__(self, num_users, nfreq=5, dv=5, k=100, recfield=1,
                  adddegree=True, addadj=False, nmax=0, seed=None,
-                 normalize_biadj=True):
+                 normalize_biadj=True, uu_topk=0):
         self.num_users = num_users
         self.nfreq = nfreq
         self.dv = dv
@@ -162,6 +219,7 @@ class BipartiteSpectralDesign(object):
         self.nmax = nmax
         self.seed = seed
         self.normalize_biadj = normalize_biadj
+        self.uu_topk = uu_topk
 
     def __call__(self, data):
         n = data.x.shape[0]
@@ -198,6 +256,17 @@ class BipartiteSpectralDesign(object):
         # ── build (optionally normalized) biadjacency B ─────
         B = normalized_biadjacency(data.edge_index, num_users, num_items,
                                    normalize=self.normalize_biadj)
+
+        # ── sparsified co-interaction edges (uu_topk) ───────
+        if self.uu_topk > 0:
+            # Selection weights always use the normalized biadjacency, even if
+            # the SVD runs on the raw one, so promiscuous nodes don't dominate.
+            Bn = B if self.normalize_biadj else normalized_biadjacency(
+                data.edge_index, num_users, num_items, normalize=True)
+            UU = topk_cooccurrence(Bn, self.uu_topk)
+            VV = topk_cooccurrence(Bn.T.tocsr(), self.uu_topk)
+            co_sp = sp.bmat([[UU, None], [None, VV]], format='csr')
+            M_sp = (M_sp + co_sp).astype(bool).astype(np.float32)
 
         # ── SVD of biadjacency ──────────────────────────────
         if self.k > 0 and self.k < min(num_users, num_items):

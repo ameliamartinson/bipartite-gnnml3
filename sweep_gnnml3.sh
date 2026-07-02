@@ -87,7 +87,8 @@ except FileNotFoundError:
     sys.exit(0)
 rows.sort(key=lambda r: r.get(rk, 0.0), reverse=True)
 cols = ["emb_in", "layers", "layer_combine", "struct_feats", "bpr_batch",
-        "nfreq", "k_svd", "lr", "biadj", rk, nk, "best_epoch", "train_time_s"]
+        "nfreq", "k_svd", "uu_topk", "lr", "biadj", rk, nk, "best_epoch",
+        "train_time_s"]
 print()
 print("=" * 120)
 print(f"RANKED gnnml3 SETTINGS on {ds} ({len(rows)} runs, sorted by {rk})")
@@ -181,7 +182,16 @@ for BA in normalized raw; do
 done
 
 # ---------------------------------------------------------------------------
-# 9. (Optional, slow) LightGCN-style minibatched BPR.
+# 9. Sparsified within-partition co-interaction edges (top-N per node).
+#    Gives the even spectral filters real user-user/item-item edges.
+# ---------------------------------------------------------------------------
+for UT in 15 30; do
+  run "uu_topk=$UT" --emb-in "$BASE_EMB_IN" --layers "$BASE_LAYERS" --layer-combine \
+      --nfreq "$BASE_NFREQ" --k "$BASE_K" --lr "$BASE_LR" --uu-topk "$UT"
+done
+
+# ---------------------------------------------------------------------------
+# 10. (Optional, slow) LightGCN-style minibatched BPR.
 # ---------------------------------------------------------------------------
 if [ "$RUN_MINIBATCH" = "1" ]; then
   for BB in 2048 8192; do
