@@ -213,7 +213,7 @@ class BipartiteSpectralDesign(object):
             V = Vt.T
 
         lambda_max = S[0]
-        freqcenter = np.linspace(lambda_max/nfreq, lambda_max, self.nfreq)
+        freqcenter = np.linspace(lambda_max/self.nfreq, lambda_max, self.nfreq)
 
         # ── split M into quadrants (COO) and build masks ────
         M_11 = M_sp[:num_users, :num_users].tocoo()
