@@ -258,6 +258,12 @@ def main():
         help="JSONL file to append the result record to",
     )
     p.add_argument(
+        "--save-model",
+        default="",
+        help="path to save a checkpoint of the best model (state_dict + final "
+        "user/item embeddings, consumable by recommend.py); empty = don't save",
+    )
+    p.add_argument(
         "--device",
         default="auto",
         help="Device: 'auto' (detect), 'cuda', 'cpu', or specific device name",
@@ -429,6 +435,24 @@ def main():
                 best = rec
                 best_epoch = ep
                 time_to_best_s = time.time() - train_start
+                if args.save_model:
+                    with torch.no_grad():
+                        ue, ie = model(data)
+                    os.makedirs(os.path.dirname(os.path.abspath(args.save_model)),
+                                exist_ok=True)
+                    torch.save(
+                        {
+                            "model": "gnnml3",
+                            "dataset": args.dataset,
+                            "epoch": ep,
+                            "metrics": {m: float(v) for m, v in rec.items()},
+                            "config": vars(args),
+                            "state_dict": model.state_dict(),
+                            "user_emb": ue.cpu(),
+                            "item_emb": ie.cpu(),
+                        },
+                        args.save_model,
+                    )
 
     train_time_s = time.time() - train_start
     peak_mem_mb = (
@@ -481,6 +505,8 @@ def main():
 
     append_jsonl(args.out, row)
     print(f"\nResult appended to {args.out}")
+    if args.save_model:
+        print(f"Best-epoch checkpoint saved to {args.save_model}")
 
 
 if __name__ == "__main__":

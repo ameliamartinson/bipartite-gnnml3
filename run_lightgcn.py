@@ -35,6 +35,12 @@ def main():
     ap.add_argument("--eval-every", type=int, default=10)
     ap.add_argument("--device", default="auto", help="'auto', 'cuda', or 'cpu'")
     ap.add_argument("--out", default=os.path.join(_HERE, "results", "benchmark.jsonl"))
+    ap.add_argument(
+        "--save-model",
+        default="",
+        help="path to save a checkpoint of the best model (state_dict + final "
+        "user/item embeddings, consumable by recommend.py); empty = don't save",
+    )
     args = ap.parse_args()
 
     # LightGCN's `world` module parses sys.argv at import time, so construct the
@@ -100,6 +106,28 @@ def main():
             **{f"precision@{k}": float(res["precision"][i]) for i, k in enumerate(ks)},
         }
 
+    def save_checkpoint(rec, epoch):
+        """Snapshot the state dict plus the propagated (post-LGC) user/item
+        embeddings, in the same schema bipartite_experiment.py saves, so
+        recommend.py can consume either model's checkpoint."""
+        Recmodel.eval()
+        with torch.no_grad():
+            ue, ie = Recmodel.computer()
+        os.makedirs(os.path.dirname(os.path.abspath(args.save_model)), exist_ok=True)
+        torch.save(
+            {
+                "model": "lightgcn",
+                "dataset": args.dataset,
+                "epoch": epoch,
+                "metrics": {m: float(v) for m, v in rec.items()},
+                "config": vars(args),
+                "state_dict": Recmodel.state_dict(),
+                "user_emb": ue.cpu(),
+                "item_emb": ie.cpu(),
+            },
+            args.save_model,
+        )
+
     best = None
     best_epoch = 0
     time_to_best_s = 0.0
@@ -111,6 +139,8 @@ def main():
             if best is None or rec[f"recall@{primary_k}"] > best[f"recall@{primary_k}"]:
                 best, best_epoch = rec, epoch
                 time_to_best_s = time.time() - train_start
+                if args.save_model:
+                    save_checkpoint(rec, epoch)
         Procedure.BPR_train_original(dataset, Recmodel, bpr, epoch, neg_k=1, w=None)
 
     # Final evaluation after the last training step.
@@ -118,6 +148,8 @@ def main():
     if best is None or rec[f"recall@{primary_k}"] > best[f"recall@{primary_k}"]:
         best, best_epoch = rec, args.epochs
         time_to_best_s = time.time() - train_start
+        if args.save_model:
+            save_checkpoint(rec, args.epochs)
 
     train_time_s = time.time() - train_start
     peak_mem_mb = (
@@ -158,6 +190,8 @@ def main():
 
     append_jsonl(args.out, row)
     print(f"\nResult appended to {args.out}")
+    if args.save_model:
+        print(f"Best-epoch checkpoint saved to {args.save_model}")
 
 
 if __name__ == "__main__":
