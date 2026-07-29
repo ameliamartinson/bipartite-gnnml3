@@ -14,6 +14,7 @@ import argparse
 import os
 import random
 import time
+from collections import Counter
 import numpy as np
 import torch
 import torch.nn as nn
@@ -174,6 +175,18 @@ def load_edges(path):
     return edges, ui
 
 
+def k_core_filter(edges, k):
+    """Recursively drop interactions until every remaining user and item has
+    at least k interactions (standard k-core dataset filtering)."""
+    while True:
+        udeg = Counter(u for u, _ in edges)
+        ideg = Counter(i for _, i in edges)
+        kept = [(u, i) for u, i in edges if udeg[u] >= k and ideg[i] >= k]
+        if len(kept) == len(edges):
+            return kept
+        edges = kept
+
+
 def count_lines(p):
     with open(p) as f:
         return sum(1 for _ in f)
@@ -183,6 +196,14 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--dataset", default="gowalla", choices=["amazon-book", "gowalla", "yelp2018"]
+    )
+    p.add_argument(
+        "--k-core",
+        type=int,
+        default=0,
+        help="keep only users/items with at least K train interactions, "
+        "applied recursively (standard k-core dataset filtering; 0 = off). "
+        "Test interactions involving dropped users/items are removed too",
     )
     p.add_argument("--nfreq", type=int, default=5)
     p.add_argument("--dv", type=float, default=5)
@@ -295,6 +316,34 @@ def main():
     tr_e, tr_ui = load_edges(f"{dd}/train.txt")
     te_e, te_ui = load_edges(f"{dd}/test.txt")
     print(f"  Train: {len(tr_e):,}  Test: {len(te_e):,}")
+
+    if args.k_core > 0:
+        print(f"Applying {args.k_core}-core filtering on train interactions...")
+        tr_e = k_core_filter(tr_e, args.k_core)
+        if not tr_e:
+            raise SystemExit(
+                f"error: the {args.k_core}-core of {args.dataset} train set is empty"
+            )
+        # Remap surviving users/items to contiguous ids and apply the same
+        # mapping to the test set, dropping test interactions that involve
+        # filtered-out nodes.
+        keep_u = sorted({u for u, _ in tr_e})
+        keep_i = sorted({i for _, i in tr_e})
+        umap = {u: n for n, u in enumerate(keep_u)}
+        imap = {i: n for n, i in enumerate(keep_i)}
+        tr_e = [(umap[u], imap[i]) for u, i in tr_e]
+        tr_ui = {}
+        for u, i in tr_e:
+            tr_ui.setdefault(u, set()).add(i)
+        te_e = [(umap[u], imap[i]) for u, i in te_e if u in umap and i in imap]
+        te_ui = {}
+        for u, i in te_e:
+            te_ui.setdefault(u, set()).add(i)
+        nu, ni = len(keep_u), len(keep_i)
+        print(
+            f"  {args.k_core}-core: {nu:,} users, {ni:,} items, "
+            f"{len(tr_e):,} train / {len(te_e):,} test interactions"
+        )
 
     print("Building graph...")
     nt = nu + ni
@@ -472,6 +521,7 @@ def main():
     row = {
         "model": "gnnml3",
         "dataset": args.dataset,
+        "k_core": args.k_core,
         "seed": args.seed,
         "epochs": args.epochs,
         "embed_dim": args.embed_dim,

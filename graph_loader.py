@@ -35,7 +35,14 @@ def matrix_to_graph(B: sp.csr_matrix): # B scipy sparse matrix
         
     return G
 
-def load_bipartite_graph(txt_path):
+def load_bipartite_graph(txt_path, k_core=None):
+    """Load a user-item interaction file as a bipartite graph.
+
+    If k_core is given, keep only the k-core of the graph: users and items
+    that still have at least k_core interactions after recursively dropping
+    nodes with fewer than k_core connections (the standard k-core filtering
+    used for recommendation datasets).
+    """
     G = nx.Graph()
     with open(txt_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -53,6 +60,9 @@ def load_bipartite_graph(txt_path):
                 i = f"item_{item_id}"
                 G.add_node(i, node_type="item")
                 G.add_edge(u,i)
+
+    if k_core is not None:
+        G = nx.k_core(G, k_core)
     return G
 
 def numeric_id(node_name):
