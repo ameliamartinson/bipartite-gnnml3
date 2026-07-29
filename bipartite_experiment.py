@@ -14,7 +14,6 @@ import argparse
 import os
 import random
 import time
-from collections import Counter
 import numpy as np
 import torch
 import torch.nn as nn
@@ -31,6 +30,7 @@ from libs.spect_conv import SpectConv, ML3Layer
 from bipartite_utils import BipartiteSpectralDesign
 from eval_common import score
 from bench_utils import append_jsonl
+from kcore import k_core_filter, remap_k_core
 
 
 def set_seed(seed):
@@ -175,18 +175,6 @@ def load_edges(path):
     return edges, ui
 
 
-def k_core_filter(edges, k):
-    """Recursively drop interactions until every remaining user and item has
-    at least k interactions (standard k-core dataset filtering)."""
-    while True:
-        udeg = Counter(u for u, _ in edges)
-        ideg = Counter(i for _, i in edges)
-        kept = [(u, i) for u, i in edges if udeg[u] >= k and ideg[i] >= k]
-        if len(kept) == len(edges):
-            return kept
-        edges = kept
-
-
 def count_lines(p):
     with open(p) as f:
         return sum(1 for _ in f)
@@ -326,20 +314,15 @@ def main():
             )
         # Remap surviving users/items to contiguous ids and apply the same
         # mapping to the test set, dropping test interactions that involve
-        # filtered-out nodes.
-        keep_u = sorted({u for u, _ in tr_e})
-        keep_i = sorted({i for _, i in tr_e})
-        umap = {u: n for n, u in enumerate(keep_u)}
-        imap = {i: n for n, i in enumerate(keep_i)}
-        tr_e = [(umap[u], imap[i]) for u, i in tr_e]
+        # filtered-out nodes. Shared with the LightGCN runner via kcore.py so
+        # both models see the exact same filtered graph.
+        tr_e, te_e, nu, ni = remap_k_core(tr_e, te_e)
         tr_ui = {}
         for u, i in tr_e:
             tr_ui.setdefault(u, set()).add(i)
-        te_e = [(umap[u], imap[i]) for u, i in te_e if u in umap and i in imap]
         te_ui = {}
         for u, i in te_e:
             te_ui.setdefault(u, set()).add(i)
-        nu, ni = len(keep_u), len(keep_i)
         print(
             f"  {args.k_core}-core: {nu:,} users, {ni:,} items, "
             f"{len(tr_e):,} train / {len(te_e):,} test interactions"

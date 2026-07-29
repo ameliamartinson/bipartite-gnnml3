@@ -76,6 +76,7 @@ def build_cmd(model, dataset, seed, args):
             "--topks", args.topks,
             "--out", args.out,
             "--device", args.device,
+            "--k-core", str(args.k_core),
         ]
     raise ValueError(model)
 
@@ -175,7 +176,8 @@ def main():
         "--k-core",
         type=int,
         default=0,
-        help="gnnml3 only: recursive k-core filtering of the train set (0 = off)",
+        help="recursive k-core filtering of the train set, applied identically "
+        "to both models via the shared kcore.py (0 = off)",
     )
     ap.add_argument(
         "--raw-biadj",

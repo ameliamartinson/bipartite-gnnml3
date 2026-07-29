@@ -233,6 +233,10 @@ class Loader(BasicDataset):
         train_file = path + '/train.txt'
         test_file = path + '/test.txt'
         self.path = path
+        # Recursive k-core filtering of the train set (0 = off). Set via
+        # world.config by run_lightgcn.py --k-core; shared with the GNNML3
+        # runner so both models see the exact same filtered graph.
+        self.k_core = config.get('k_core', 0)
         trainUniqueUsers, trainItem, trainUser = [], [], []
         testUniqueUsers, testItem, testUser = [], [], []
         self.traindataSize = 0
@@ -281,7 +285,33 @@ class Loader(BasicDataset):
         self.testUniqueUsers = np.array(testUniqueUsers)
         self.testUser = np.array(testUser)
         self.testItem = np.array(testItem)
-        
+
+        if self.k_core > 0:
+            # kcore.py lives at the repo root (added to sys.path by
+            # run_lightgcn.py), not inside this submodule.
+            from kcore import k_core_filter, remap_k_core
+            train_edges = k_core_filter(
+                list(zip(self.trainUser.tolist(), self.trainItem.tolist())),
+                self.k_core,
+            )
+            if not train_edges:
+                raise ValueError(f"the {self.k_core}-core of the train set is empty")
+            test_edges = list(zip(self.testUser.tolist(), self.testItem.tolist()))
+            train_edges, test_edges, n_u, n_i = remap_k_core(train_edges, test_edges)
+            self.trainUser = np.array([u for u, _ in train_edges])
+            self.trainItem = np.array([i for _, i in train_edges])
+            self.trainUniqueUsers = np.array(sorted({u for u, _ in train_edges}))
+            self.traindataSize = len(train_edges)
+            self.testUser = np.array([u for u, _ in test_edges])
+            self.testItem = np.array([i for _, i in test_edges])
+            self.testUniqueUsers = np.array(sorted({u for u, _ in test_edges}))
+            self.testDataSize = len(test_edges)
+            self.n_user, self.m_item = n_u, n_i
+            print(
+                f"{self.k_core}-core: {n_u} users, {n_i} items, "
+                f"{self.traindataSize} train / {self.testDataSize} test interactions"
+            )
+
         self.Graph = None
         print(f"{self.trainDataSize} interactions for training")
         print(f"{self.testDataSize} interactions for testing")
@@ -343,6 +373,10 @@ class Loader(BasicDataset):
         print("loading adjacency matrix")
         if self.Graph is None:
             try:
+                if self.k_core > 0:
+                    # The cached matrix was built from the unfiltered files;
+                    # never load or overwrite it for a k-core filtered graph.
+                    raise FileNotFoundError
                 pre_adj_mat = sp.load_npz(self.path + '/s_pre_adj_mat.npz')
                 print("successfully loaded...")
                 norm_adj = pre_adj_mat
@@ -366,8 +400,10 @@ class Loader(BasicDataset):
                 norm_adj = norm_adj.dot(d_mat)
                 norm_adj = norm_adj.tocsr()
                 end = time()
-                print(f"costing {end-s}s, saved norm_mat...")
-                sp.save_npz(self.path + '/s_pre_adj_mat.npz', norm_adj)
+                print(f"costing {end-s}s")
+                if self.k_core == 0:
+                    sp.save_npz(self.path + '/s_pre_adj_mat.npz', norm_adj)
+                    print("saved norm_mat...")
 
             if self.split == True:
                 self.Graph = self._split_A_hat(norm_adj)

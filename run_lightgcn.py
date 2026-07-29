@@ -25,6 +25,13 @@ def main():
     ap.add_argument(
         "--dataset", default="gowalla", choices=["amazon-book", "gowalla", "yelp2018"]
     )
+    ap.add_argument(
+        "--k-core",
+        type=int,
+        default=0,
+        help="recursive k-core filtering of the train set, shared with the "
+        "GNNML3 runner via kcore.py (0 = off)",
+    )
     ap.add_argument("--seed", type=int, default=2020)
     ap.add_argument("--epochs", type=int, default=1000)
     ap.add_argument("--recdim", type=int, default=64, help="embedding dim")
@@ -83,6 +90,8 @@ def main():
     primary_k = ks[0]
     # world.topks drives Procedure.Test's output ordering.
     world.topks = ks
+    # Picked up by the (modified) LightGCN dataloader to filter/remap the graph.
+    world.config["k_core"] = args.k_core
 
     t_setup = time.time()
     dataset = dataloader.Loader(
@@ -169,6 +178,7 @@ def main():
     row = {
         "model": "lightgcn",
         "dataset": args.dataset,
+        "k_core": args.k_core,
         "seed": args.seed,
         "epochs": args.epochs,
         "embed_dim": args.recdim,
