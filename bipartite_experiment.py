@@ -267,6 +267,18 @@ def main():
         help="JSONL file to append the result record to",
     )
     p.add_argument(
+        "--history-out",
+        default="",
+        help="JSONL file to append per-evaluation epoch history records "
+        "(epoch, loss, metrics) to; empty = don't record history",
+    )
+    p.add_argument(
+        "--run-id",
+        default="",
+        help="identifier embedded in the result and history records so a "
+        "sweep/test harness can join them",
+    )
+    p.add_argument(
         "--save-model",
         default="",
         help="path to save a checkpoint of the best model (state_dict + final "
@@ -463,6 +475,23 @@ def main():
                 f"  Epoch {ep:4d} | Loss: {loss_val:.4f} | "
                 f"R@{primary_k}: {r_primary:.4f}  N@{primary_k}: {rec[f'ndcg@{primary_k}']:.4f}"
             )
+            if args.history_out:
+                hrec = {
+                    "model": "gnnml3",
+                    "run_id": args.run_id,
+                    "dataset": args.dataset,
+                    "seed": args.seed,
+                    "epoch": ep,
+                    "loss": round(loss_val, 6),
+                    "nfreq": args.nfreq,
+                    "dv": args.dv,
+                    "k_svd": args.k,
+                }
+                for k in ks:
+                    hrec[f"recall@{k}"] = round(rec[f"recall@{k}"], 6)
+                    hrec[f"ndcg@{k}"] = round(rec[f"ndcg@{k}"], 6)
+                    hrec[f"precision@{k}"] = round(rec[f"precision@{k}"], 6)
+                append_jsonl(args.history_out, hrec)
             if best is None or r_primary > best[f"recall@{primary_k}"]:
                 best = rec
                 best_epoch = ep
@@ -503,6 +532,7 @@ def main():
 
     row = {
         "model": "gnnml3",
+        "run_id": args.run_id,
         "dataset": args.dataset,
         "k_core": args.k_core,
         "seed": args.seed,
