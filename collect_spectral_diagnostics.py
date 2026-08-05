@@ -15,6 +15,7 @@ thesis figures can be regenerated from files instead of a notebook session.
 
 Usage:
   python collect_spectral_diagnostics.py --dataset gowalla --k 400
+  python collect_spectral_diagnostics.py --dataset gowalla --k-core 20 --k 800
 """
 
 import argparse
@@ -26,18 +27,24 @@ import numpy as np
 import torch
 
 from bipartite_utils import normalized_biadjacency, _svds_seeded, h, g
+from kcore import k_core_filter, remap_k_core
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def load_train_edge_index(dataset):
-    """Build a (2, E) user->item edge_index (item ids offset by num_users)."""
+def load_train_edge_index(dataset, k_core=0):
+    """Build a (2, E) user->item edge_index (item ids offset by num_users).
+
+    With k_core > 0, train interactions are first passed through the shared
+    kcore.py filter (k_core_filter + remap_k_core) -- the exact graph the
+    experiment runners consume -- so the spectrum matches the filtered graph.
+    """
     dd = os.path.join(_HERE, "datasets", dataset)
     with open(os.path.join(dd, "user_list.txt")) as f:
         num_users = sum(1 for _ in f) - 1
     with open(os.path.join(dd, "item_list.txt")) as f:
         num_items = sum(1 for _ in f) - 1
-    us, vs = [], []
+    edges = []
     with open(os.path.join(dd, "train.txt")) as f:
         for line in f:
             parts = line.split()
@@ -45,8 +52,16 @@ def load_train_edge_index(dataset):
                 continue
             u = int(parts[0])
             for i in parts[1:]:
-                us.append(u)
-                vs.append(num_users + int(i))
+                edges.append((u, int(i)))
+    if k_core > 0:
+        edges = k_core_filter(edges, k_core)
+        if not edges:
+            raise SystemExit(
+                f"error: the {k_core}-core of {dataset} train set is empty"
+            )
+        edges, _test, num_users, num_items = remap_k_core(edges, [])
+    us = [u for u, _ in edges]
+    vs = [num_users + i for _, i in edges]
     ei = torch.tensor([us, vs], dtype=torch.int64)
     return ei, num_users, num_items
 
@@ -55,7 +70,13 @@ def analyze(B, k, seed, nfreqs, dv):
     """Spectrum, energy curve, and band responses for one biadjacency."""
     total_energy = float((B.data.astype(np.float64) ** 2).sum())  # ||B||_F^2
     k = min(k, min(B.shape) - 1)
-    U, S, Vt = _svds_seeded(B, k, seed)
+    if min(B.shape) <= 5000:
+        # Small enough for a dense, exact SVD: cheaper and more reliable than
+        # ARPACK near the full rank, and it yields every singular value, i.e.
+        # the complete energy curve at every truncation rank.
+        U, S, Vt = np.linalg.svd(B.toarray().astype(np.float64), full_matrices=False)
+    else:
+        U, S, Vt = _svds_seeded(B, k, seed)
     S = np.sort(S)[::-1]
 
     cum = np.cumsum(S.astype(np.float64) ** 2)
@@ -83,7 +104,7 @@ def analyze(B, k, seed, nfreqs, dv):
         "shape": [int(B.shape[0]), int(B.shape[1])],
         "nnz": int(B.nnz),
         "total_frobenius_energy": total_energy,
-        "k_computed": int(k),
+        "k_computed": int(len(S)),
         "singular_values": [float(s) for s in S],
         "energy_retained_at_rank": [float(e) for e in energy_retained],
         "band_responses": bands,
@@ -98,6 +119,13 @@ def main():
                     help="how many singular values to compute (>= the largest "
                     "k_svd used in any experiment, so every run's truncation "
                     "point lies on the curve)")
+    ap.add_argument(
+        "--k-core",
+        type=int,
+        default=0,
+        help="recursive k-core filtering of the train set, applied identically "
+        "to the experiment runners via the shared kcore.py (0 = off)",
+    )
     ap.add_argument("--nfreqs", default="[2,5,8]",
                     help="Python-literal list of band counts to analyze")
     ap.add_argument("--dv", type=float, default=5, help="Gaussian bandwidth b")
@@ -109,11 +137,13 @@ def main():
     nfreqs = list(eval(args.nfreqs))
 
     print(f"Loading {args.dataset}...")
-    ei, nu, ni = load_train_edge_index(args.dataset)
+    if args.k_core > 0:
+        print(f"Applying {args.k_core}-core filtering on train interactions...")
+    ei, nu, ni = load_train_edge_index(args.dataset, args.k_core)
     print(f"  users={nu:,} items={ni:,} train edges={ei.shape[1]:,}")
 
     out = {"dataset": args.dataset, "num_users": nu, "num_items": ni,
-           "dv": args.dv, "seed": args.seed}
+           "k_core": args.k_core, "dv": args.dv, "seed": args.seed}
     for kind, normalize in [("normalized", True), ("raw", False)]:
         print(f"SVD of {kind} biadjacency (k={args.k})...")
         B = normalized_biadjacency(ei, nu, ni, normalize=normalize)
