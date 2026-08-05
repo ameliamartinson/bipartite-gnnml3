@@ -204,11 +204,15 @@ class BipartiteSpectralDesign(object):
               filters real user-user/item-item edges to act on -- the effect of
               recfield=2 -- while keeping the mask ~topk edges/node instead of
               the dense 2-hop blow-up (~1000+ edges/node on these datasets).
+        off_diag: if True, also set the first off-diagonal band (i, i+/-1) in
+              the UU and VV blocks of the receptive-field mask, giving the even
+              spectral filters within-partition edges between consecutive user
+              (item) ids.
     """
 
     def __init__(self, num_users, nfreq=5, dv=5, k=100, recfield=1,
                  adddegree=True, addadj=False, nmax=0, seed=None,
-                 normalize_biadj=True, uu_topk=0):
+                 normalize_biadj=True, uu_topk=0, off_diag=False):
         self.num_users = num_users
         self.nfreq = nfreq
         self.dv = dv
@@ -220,6 +224,7 @@ class BipartiteSpectralDesign(object):
         self.seed = seed
         self.normalize_biadj = normalize_biadj
         self.uu_topk = uu_topk
+        self.off_diag = off_diag
 
     def __call__(self, data):
         n = data.x.shape[0]
@@ -266,6 +271,14 @@ class BipartiteSpectralDesign(object):
             UU = topk_cooccurrence(Bn, self.uu_topk)
             VV = topk_cooccurrence(Bn.T.tocsr(), self.uu_topk)
             co_sp = sp.bmat([[UU, None], [None, VV]], format='csr')
+            M_sp = (M_sp + co_sp).astype(bool).astype(np.float32)
+
+        if self.off_diag:
+            off_diags_uu = sp.diags([np.ones(num_users - 1), np.ones(num_users - 1)],
+                  offsets=[-1, 1], shape=(num_users, num_users), format='csr')
+            off_diags_vv = sp.diags([np.ones(num_items - 1), np.ones(num_items - 1)],
+                  offsets=[-1, 1], shape=(num_items, num_items), format='csr')
+            co_sp = sp.bmat([[off_diags_uu, None], [None, off_diags_vv]], format='csr')
             M_sp = (M_sp + co_sp).astype(bool).astype(np.float32)
 
         # ── SVD of biadjacency ──────────────────────────────

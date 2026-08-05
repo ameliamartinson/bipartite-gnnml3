@@ -21,7 +21,8 @@ from bench_utils import read_jsonl
 # Fields that define a configuration (missing fields are treated as "-").
 CONFIG_FIELDS = [
     "model", "dataset", "emb_in", "layers", "layer_combine", "struct_feats",
-    "bpr_batch", "nfreq", "k_svd", "uu_topk", "biadj", "lr", "decay", "epochs",
+    "bpr_batch", "nfreq", "k_svd", "uu_topk", "off_diag", "biadj", "lr",
+    "decay", "epochs",
 ]
 
 
@@ -69,7 +70,7 @@ def main():
     table.sort(key=lambda t: (t["dataset"], -t["recall_mean"]))
 
     show = ["model", "dataset", "emb_in", "layers", "bpr_batch", "nfreq",
-            "k_svd", "uu_topk", "seeds"]
+            "k_svd", "uu_topk", "off_diag", "seeds"]
     lines = [f"# Thesis benchmark summary (@{args.topk})", ""]
     lines.append("| " + " | ".join(show + [f"Recall@{args.topk}",
                  f"NDCG@{args.topk}", "best_ep", "time_s", "params"]) + " |")

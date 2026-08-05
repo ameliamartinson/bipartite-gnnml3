@@ -212,6 +212,13 @@ def main():
         "node (0 = off). Gives the even spectral filters real within-partition "
         "edges without the dense 2-hop memory blow-up",
     )
+    p.add_argument(
+        "--off-diag",
+        action="store_true",
+        help="add the first off-diagonal band (i, i+/-1) in the UU and VV "
+        "blocks of the receptive-field mask, giving the even spectral filters "
+        "within-partition edges between consecutive user/item ids",
+    )
     p.add_argument("--embed-dim", type=int, default=64)
     p.add_argument(
         "--emb-in",
@@ -355,7 +362,8 @@ def main():
     biadj_kind = "raw" if args.raw_biadj else "normalized"
     print(
         f"Spectral design (nfreq={args.nfreq}, dv={args.dv}, k={args.k}, "
-        f"biadj={biadj_kind}, uu_topk={args.uu_topk})..."
+        f"biadj={biadj_kind}, uu_topk={args.uu_topk}, "
+        f"off_diag={args.off_diag})..."
     )
     t0 = time.time()
     tf = BipartiteSpectralDesign(
@@ -369,6 +377,7 @@ def main():
         seed=args.seed,
         normalize_biadj=not args.raw_biadj,
         uu_topk=args.uu_topk,
+        off_diag=args.off_diag,
     )
     data = tf(data)
     setup_time_s = time.time() - t0
@@ -558,6 +567,7 @@ def main():
         "k_svd": args.k,
         "recfield": args.recfield,
         "uu_topk": args.uu_topk,
+        "off_diag": args.off_diag,
         "biadj": biadj_kind,
         "amp": bool(use_amp),
     }
