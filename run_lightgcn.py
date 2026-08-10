@@ -23,7 +23,10 @@ _LGN_DATA = os.path.join(_HERE, "LightGCN-PyTorch", "data")
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--dataset", default="gowalla", choices=["amazon-book", "gowalla", "yelp2018"]
+        "--dataset",
+        default="gowalla",
+        choices=["amazon-book", "gowalla", "yelp2018", "spotify"],
+        help="spotify requires running convert_spotify.py first",
     )
     ap.add_argument(
         "--k-core",

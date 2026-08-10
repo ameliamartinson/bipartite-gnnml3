@@ -1,3 +1,4 @@
 datasets/MovieLens
+datasets/spotify*
 __pycache__
 tutorial

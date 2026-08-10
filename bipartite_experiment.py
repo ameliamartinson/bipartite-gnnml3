@@ -183,7 +183,10 @@ def count_lines(p):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument(
-        "--dataset", default="gowalla", choices=["amazon-book", "gowalla", "yelp2018"]
+        "--dataset",
+        default="gowalla",
+        choices=["amazon-book", "gowalla", "yelp2018", "spotify"],
+        help="spotify requires running convert_spotify.py first",
     )
     p.add_argument(
         "--k-core",
