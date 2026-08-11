@@ -263,7 +263,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dataset", default="gowalla",
-                    choices=["amazon-book", "gowalla", "yelp2018"])
+                    choices=["amazon-book", "gowalla", "yelp2018", "spotify"],
+                    help="spotify requires running convert_spotify.py first; "
+                    "consider --extra '--k-core K' since the raw MPD graph is "
+                    "dominated by single-playlist tracks")
     ap.add_argument("--epochs", type=int, default=300)
     ap.add_argument("--eval-every", type=int, default=10)
     ap.add_argument("--device", default="auto")
