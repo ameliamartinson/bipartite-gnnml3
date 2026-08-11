@@ -30,7 +30,12 @@ from libs.spect_conv import SpectConv, ML3Layer
 from bipartite_utils import BipartiteSpectralDesign
 from eval_common import score
 from bench_utils import append_jsonl
-from kcore import k_core_filter, remap_k_core
+from kcore import (
+    k_core_filter,
+    load_k_core_cache,
+    remap_k_core,
+    save_k_core_cache,
+)
 
 
 def set_seed(seed):
@@ -329,16 +334,24 @@ def main():
 
     if args.k_core > 0:
         print(f"Applying {args.k_core}-core filtering on train interactions...")
-        tr_e = k_core_filter(tr_e, args.k_core)
-        if not tr_e:
-            raise SystemExit(
-                f"error: the {args.k_core}-core of {args.dataset} train set is empty"
-            )
-        # Remap surviving users/items to contiguous ids and apply the same
-        # mapping to the test set, dropping test interactions that involve
-        # filtered-out nodes. Shared with the LightGCN runner via kcore.py so
-        # both models see the exact same filtered graph.
-        tr_e, te_e, nu, ni = remap_k_core(tr_e, te_e)
+        train_path, test_path = f"{dd}/train.txt", f"{dd}/test.txt"
+        cached = load_k_core_cache(train_path, test_path, args.k_core)
+        if cached is not None:
+            tr_e, te_e, nu, ni = cached
+            print("  (loaded from cache)")
+        else:
+            tr_e = k_core_filter(tr_e, args.k_core)
+            if not tr_e:
+                raise SystemExit(
+                    f"error: the {args.k_core}-core of {args.dataset} train set is empty"
+                )
+            # Remap surviving users/items to contiguous ids and apply the same
+            # mapping to the test set, dropping test interactions that involve
+            # filtered-out nodes. Shared with the LightGCN runner via kcore.py so
+            # both models see the exact same filtered graph.
+            tr_e, te_e, nu, ni = remap_k_core(tr_e, te_e)
+            save_k_core_cache(train_path, test_path, args.k_core,
+                              (tr_e, te_e, nu, ni))
         tr_ui = {}
         for u, i in tr_e:
             tr_ui.setdefault(u, set()).add(i)

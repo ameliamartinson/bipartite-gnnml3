@@ -7,6 +7,9 @@ model. The k-core of a graph is unique and the remapping below is
 deterministic, so identical input files yield identical filtered graphs.
 """
 
+import os
+import pickle
+
 import networkx as nx
 
 
@@ -35,3 +38,46 @@ def remap_k_core(train_edges, test_edges):
     train = [(umap[u], imap[i]) for u, i in train_edges]
     test = [(umap[u], imap[i]) for u, i in test_edges if u in umap and i in imap]
     return train, test, len(keep_u), len(keep_i)
+
+
+def _cache_key(train_path, test_path):
+    """Validity token for a cached k-core: size+mtime of the source files."""
+    return tuple((os.path.getsize(p), int(os.path.getmtime(p)))
+                 for p in (train_path, test_path))
+
+
+def _cache_path(train_path, k):
+    return os.path.join(os.path.dirname(train_path), ".kcore_cache", f"k{k}.pkl")
+
+
+def load_k_core_cache(train_path, test_path, k):
+    """Return the cached (train_edges, test_edges, n_users, n_items) produced
+    by k_core_filter + remap_k_core for this dataset and k, or None if there
+    is no cache entry or the source train/test files have changed."""
+    try:
+        with open(_cache_path(train_path, k), "rb") as f:
+            entry = pickle.load(f)
+        if entry["key"] != _cache_key(train_path, test_path):
+            return None
+        return entry["train"], entry["test"], entry["n_users"], entry["n_items"]
+    except (OSError, EOFError, pickle.UnpicklingError, KeyError):
+        return None
+
+
+def save_k_core_cache(train_path, test_path, k, result):
+    """Cache the (train_edges, test_edges, n_users, n_items) tuple of a k-core
+    filtering so later runs on the same dataset and k skip the recomputation.
+    Writes are atomic so concurrent runners never see a partial file."""
+    entry = {
+        "key": _cache_key(train_path, test_path),
+        "train": result[0],
+        "test": result[1],
+        "n_users": result[2],
+        "n_items": result[3],
+    }
+    path = _cache_path(train_path, k)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + f".tmp{os.getpid()}"
+    with open(tmp, "wb") as f:
+        pickle.dump(entry, f)
+    os.replace(tmp, path)
