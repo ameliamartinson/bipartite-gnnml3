@@ -265,7 +265,14 @@ def main():
         "--decay",
         type=float,
         default=1e-4,
-        help="L2 weight decay (matched to LightGCN's --decay default)",
+        help="L2 regularization strength: applied as Adam weight_decay and as "
+        "an explicit L2 penalty on the user/item embeddings (LightGCN-style)",
+    )
+    p.add_argument(
+        "--clip",
+        type=float,
+        default=1.0,
+        help="max gradient norm for clipping (0 = no clipping)",
     )
     p.add_argument("--seed", type=int, default=2020, help="random seed (LightGCN uses 2020)")
     p.add_argument(
@@ -451,7 +458,15 @@ def main():
         ue, ie = model(data)
         pos_s = (ue[u_idx] * ie[pos_idx]).sum(1)
         neg_s = (ue[u_idx] * ie[neg_idx]).sum(1)
-        return -F.logsigmoid(pos_s - neg_s).mean()
+        bpr = -F.logsigmoid(pos_s - neg_s).mean()
+        # LightGCN-style L2 penalty on the involved user/item embeddings, scaled
+        # by --decay, to bound embedding norms (BPR itself has no such bound).
+        reg = 0.5 * (
+            ue[u_idx].pow(2).sum(1).mean()
+            + ie[pos_idx].pow(2).sum(1).mean()
+            + ie[neg_idx].pow(2).sum(1).mean()
+        )
+        return bpr + args.decay * reg
 
     def optimize(u_idx, pos_idx, neg_idx):
         opt.zero_grad()
@@ -459,11 +474,16 @@ def main():
             with torch.amp.autocast(device_type="cuda"):
                 loss = compute_loss(u_idx, pos_idx, neg_idx)
             scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            if args.clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
             scaler.step(opt)
             scaler.update()
         else:
             loss = compute_loss(u_idx, pos_idx, neg_idx)
             loss.backward()
+            if args.clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
             opt.step()
         return loss.item()
 
@@ -570,6 +590,7 @@ def main():
         "layers": n_layers,
         "lr": args.lr,
         "decay": args.decay,
+        "clip": args.clip,
         "device": device_name,
         "best_epoch": best_epoch,
         "setup_time_s": round(setup_time_s, 3),

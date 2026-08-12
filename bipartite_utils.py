@@ -244,9 +244,10 @@ class BipartiteSpectralDesign(object):
         A_sp = sp.csr_matrix((data_vals, (row, col)), shape=(n, n))
         A_sp.data = np.ones_like(A_sp.data, dtype=np.float32)
 
-        # ── optional degree feature ─────────────────────────
+        # ── optional degree feature (log1p-scaled) ──────────
         if self.adddegree:
             deg = np.array(A_sp.sum(0)).flatten()
+            deg = np.log1p(deg).astype(np.float32)
             data.x = torch.cat([data.x, torch.tensor(deg).unsqueeze(-1)], 1)
 
         # ── receptive field mask M (sparse) ─────────────────
