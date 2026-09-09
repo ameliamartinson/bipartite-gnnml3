@@ -13,19 +13,19 @@ Usage:
 import argparse
 import os
 import random
+import sys
 import time
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
 
-import sys
-
 # Anchor imports/paths to this file's directory so the script works from any CWD.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_HERE, "gnn-matlang"))
-sys.path.insert(0, _HERE)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "gnn-matlang"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from libs.spect_conv import SpectConv, ML3Layer
 from bipartite_utils import BipartiteSpectralDesign
 from eval_common import score
@@ -36,6 +36,8 @@ from kcore import (
     remap_k_core,
     save_k_core_cache,
 )
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def set_seed(seed):
@@ -79,16 +81,31 @@ class GNNML3LinkPredictor(nn.Module):
         use_struct_feats: when embeddings are on, also concatenate the structural
                 features; ignored (forced True) when emb_in == 0.
         layer_combine: average all layer outputs instead of using just the last.
+        nout2: width of the multiplicative tanh*tanh gating branch of ML3Layer;
+                0 removes that branch entirely (ablation).
+        learnedge: whether ML3Layer learns the edge features (its edge MLP) or
+                uses the fixed spectral supports as-is (ablation).
+        shared_head: use one readout projection for users and items instead of
+                two partition-specific ones (ablation).
     """
 
     def __init__(self, ninp, ne, num_users, num_nodes=0, emb_in=0, n_layers=3,
                  nout1=64, nout2=32, embed_dim=64, use_struct_feats=True,
-                 layer_combine=False):
+                 layer_combine=False, learnedge=True, shared_head=False,
+                 grad_checkpoint=False):
         super().__init__()
         self.num_users = num_users
         self.emb_in = emb_in
         self.use_struct_feats = use_struct_feats or emb_in == 0
         self.layer_combine = layer_combine
+        self.learnedge = learnedge
+        self.shared_head = shared_head
+        # Recompute each layer's activations in backward instead of storing the
+        # per-edge message tensors. The supports carry millions of edges, so
+        # these are the dominant memory term; checkpointing trades ~30% compute
+        # for a large drop in peak memory. Numerically identical (no RNG in the
+        # forward pass).
+        self.grad_checkpoint = grad_checkpoint
 
         if emb_in > 0:
             self.node_emb = nn.Embedding(num_nodes, emb_in)
@@ -100,7 +117,7 @@ class GNNML3LinkPredictor(nn.Module):
         nin = nout1 + nout2
         self.convs = nn.ModuleList(
             ML3Layer(
-                learnedge=True,
+                learnedge=learnedge,
                 nedgeinput=ne,
                 nedgeoutput=ne,
                 ninp=conv_in if li == 0 else nin,
@@ -109,8 +126,15 @@ class GNNML3LinkPredictor(nn.Module):
             )
             for li in range(n_layers)
         )
-        self.user_head = nn.Linear(nin, embed_dim)
-        self.item_head = nn.Linear(nin, embed_dim)
+        if shared_head:
+            # Single readout shared by both partitions (ablation: does the
+            # user/item-specific projection matter?).
+            self.head = nn.Linear(nin, embed_dim)
+            self.user_head = self.item_head = None
+        else:
+            self.head = None
+            self.user_head = nn.Linear(nin, embed_dim)
+            self.item_head = nn.Linear(nin, embed_dim)
 
     def forward(self, data):
         ei, ea = data.edge_index2, data.edge_attr2
@@ -122,10 +146,54 @@ class GNNML3LinkPredictor(nn.Module):
             x = data.x
         outs = []
         for conv in self.convs:
-            x = conv(x, ei, ea)
+            if self.grad_checkpoint and self.training:
+                x = torch.utils.checkpoint.checkpoint(
+                    conv, x, ei, ea, use_reentrant=False)
+            else:
+                x = conv(x, ei, ea)
             outs.append(x)
         h = torch.stack(outs, dim=0).mean(0) if self.layer_combine else outs[-1]
+        if self.head is not None:
+            return self.head(h[: self.num_users]), self.head(h[self.num_users :])
         return self.user_head(h[: self.num_users]), self.item_head(h[self.num_users :])
+
+
+def ablate_supports(data, num_users, nfreq, drop_identity=False,
+                    drop_even=False, drop_odd=False):
+    """Zero out selected spectral-support columns of ``edge_attr2`` in place.
+
+    ``BipartiteSpectralDesign`` lays the supports out as columns
+    ``0 .. nfreq-1`` (the Gaussian frequency bands) followed by the identity
+    support at column ``nfreq`` (and, if ``addadj``, an adjacency support after
+    it). Within the band columns the within-partition blocks (UU and VV) carry
+    the *even* filters ``h(sigma)`` and the cross-partition blocks (UV and VU)
+    carry the *odd* filters ``g(sigma)``. This helper removes exactly one of
+    those mechanisms at a time, so the rest of the pipeline (masks, edge
+    network, message passing) is untouched and the comparison stays paired.
+
+    Args:
+        data: Data object carrying ``edge_index2`` / ``edge_attr2``.
+        num_users: user/item split point of the node ids.
+        nfreq: number of frequency-band columns.
+        drop_identity: zero the identity support (self-connection in the conv).
+        drop_even: zero the even-filter columns on within-partition edges.
+        drop_odd: zero the odd-filter columns on cross-partition edges.
+    """
+    if not (drop_identity or drop_even or drop_odd):
+        return data
+    ea = data.edge_attr2
+    ei = data.edge_index2
+    if drop_identity:
+        ea[:, nfreq] = 0.0
+    if nfreq > 0 and (drop_even or drop_odd):
+        is_user = ei[0] < num_users
+        col_is_user = ei[1] < num_users
+        same_partition = is_user == col_is_user
+        if drop_even:
+            ea[same_partition, :nfreq] = 0.0
+        if drop_odd:
+            ea[~same_partition, :nfreq] = 0.0
+    return data
 
 
 @torch.no_grad()
@@ -229,6 +297,22 @@ def main():
     )
     p.add_argument("--embed-dim", type=int, default=64)
     p.add_argument(
+        "--design-cache",
+        default="",
+        help="directory to cache the built spectral supports "
+        "(x/edge_index2/edge_attr2) keyed by the spectral-design config; empty "
+        "= rebuild every run. Architecture ablations share one design, so this "
+        "removes the repeated SVD/support cost from an ablation matrix",
+    )
+    p.add_argument(
+        "--design-seed",
+        type=int,
+        default=-1,
+        help="seed for the truncated-SVD start vector; -1 = use --seed. Pin it "
+        "to make the spectral design identical across training seeds (and "
+        "therefore cacheable across an ablation matrix)",
+    )
+    p.add_argument(
         "--emb-in",
         type=int,
         default=0,
@@ -249,6 +333,63 @@ def main():
         action="store_true",
         help="average all layer outputs (LightGCN-style jumping-knowledge mean) "
         "instead of using only the last layer's output",
+    )
+    # ── ablation switches (all default to the full model) ────────────────
+    p.add_argument(
+        "--ablation",
+        default="",
+        help="free-form tag for the ablation this run represents; stored in the "
+        "result record so a study driver can join runs into variants",
+    )
+    p.add_argument(
+        "--no-learnedge",
+        action="store_true",
+        help="ablation: drop ML3Layer's learnable edge network and use the fixed "
+        "spectral supports as edge weights",
+    )
+    p.add_argument(
+        "--nout2",
+        type=int,
+        default=32,
+        help="width of the ML3 multiplicative tanh*tanh gating branch; "
+        "0 removes that branch (ablation)",
+    )
+    p.add_argument(
+        "--shared-head",
+        action="store_true",
+        help="ablation: one readout projection shared by users and items instead "
+        "of partition-specific user/item heads",
+    )
+    p.add_argument(
+        "--no-identity",
+        action="store_true",
+        help="ablation: zero the identity support column, removing the conv's "
+        "self-connection (the gating branch still sees the raw node features)",
+    )
+    p.add_argument(
+        "--no-even",
+        action="store_true",
+        help="ablation: zero the even spectral filters on within-partition "
+        "(UU/VV) edges, i.e. remove user-user / item-item message passing",
+    )
+    p.add_argument(
+        "--no-odd",
+        action="store_true",
+        help="ablation: zero the odd spectral filters on cross-partition "
+        "(UV/VU) edges, i.e. remove user-item message passing",
+    )
+    p.add_argument(
+        "--no-degree",
+        action="store_true",
+        help="ablation: drop the log-degree structural feature (indicator "
+        "columns only)",
+    )
+    p.add_argument(
+        "--grad-checkpoint",
+        action="store_true",
+        help="recompute layer activations in backward (torch.utils.checkpoint) "
+        "to cut peak memory on graphs with millions of support edges; ~30%% "
+        "slower per epoch, numerically identical",
     )
     p.add_argument(
         "--bpr-batch",
@@ -383,27 +524,62 @@ def main():
     data = Data(edge_index=ei, x=x, y=torch.tensor([0]))
 
     biadj_kind = "raw" if args.raw_biadj else "normalized"
+    design_seed = args.seed if args.design_seed < 0 else args.design_seed
     print(
         f"Spectral design (nfreq={args.nfreq}, dv={args.dv}, k={args.k}, "
         f"biadj={biadj_kind}, uu_topk={args.uu_topk}, "
         f"off_diag={args.off_diag})..."
     )
     t0 = time.time()
-    tf = BipartiteSpectralDesign(
-        nu,
-        nfreq=args.nfreq,
-        dv=args.dv,
-        k=args.k,
-        recfield=args.recfield,
-        adddegree=True,
-        nmax=0,
-        seed=args.seed,
-        normalize_biadj=not args.raw_biadj,
-        uu_topk=args.uu_topk,
-        off_diag=args.off_diag,
-    )
-    data = tf(data)
+    # The support construction (SVD + per-edge spectral entries) depends only on
+    # the spectral-design configuration, not on the architecture flags, so an
+    # ablation matrix can build it once and reuse it. Keyed on every input that
+    # changes the result, including the design seed.
+    cache_path = ""
+    if args.design_cache:
+        import hashlib
+        os.makedirs(args.design_cache, exist_ok=True)
+        key = "|".join(map(str, [
+            args.dataset, args.k_core, nu, ni, args.nfreq, args.dv, args.k,
+            args.recfield, int(not args.no_degree), biadj_kind, args.uu_topk,
+            int(args.off_diag), design_seed,
+        ]))
+        digest = hashlib.sha1(key.encode()).hexdigest()[:16]
+        cache_path = os.path.join(args.design_cache, f"design_{digest}.pt")
+
+    if cache_path and os.path.exists(cache_path):
+        blob = torch.load(cache_path, map_location="cpu", weights_only=False)
+        data.x = blob["x"]
+        data.edge_index2 = blob["edge_index2"]
+        data.edge_attr2 = blob["edge_attr2"]
+        print(f"  (design loaded from cache {os.path.basename(cache_path)})")
+    else:
+        tf = BipartiteSpectralDesign(
+            nu,
+            nfreq=args.nfreq,
+            dv=args.dv,
+            k=args.k,
+            recfield=args.recfield,
+            adddegree=not args.no_degree,
+            nmax=0,
+            seed=design_seed,
+            normalize_biadj=not args.raw_biadj,
+            uu_topk=args.uu_topk,
+            off_diag=args.off_diag,
+        )
+        data = tf(data)
+        if cache_path:
+            torch.save({"x": data.x, "edge_index2": data.edge_index2,
+                        "edge_attr2": data.edge_attr2, "key": key}, cache_path)
     setup_time_s = time.time() - t0
+    ablate_supports(
+        data,
+        nu,
+        args.nfreq,
+        drop_identity=args.no_identity,
+        drop_even=args.no_even,
+        drop_odd=args.no_odd,
+    )
     print(f"  Done in {setup_time_s:.1f}s")
     print(
         f"  edge_index2: {data.edge_index2.shape}, edge_attr2: {data.edge_attr2.shape}"
@@ -418,9 +594,13 @@ def main():
         num_nodes=data.x.shape[0],
         emb_in=args.emb_in,
         n_layers=args.layers,
+        nout2=args.nout2,
         embed_dim=args.embed_dim,
         use_struct_feats=use_struct_feats,
         layer_combine=args.layer_combine,
+        learnedge=not args.no_learnedge,
+        shared_head=args.shared_head,
+        grad_checkpoint=args.grad_checkpoint,
     )
     model = model.to(device)
     data = data.to(device)
@@ -438,6 +618,8 @@ def main():
         f"{'mean' if args.layer_combine else 'last'}-layer readout, "
         f"input=[{', '.join(feat_desc)}]"
     )
+    if args.ablation:
+        print(f"  Ablation: {args.ablation}")
     print(f"  Params: {n_params:,}")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -494,7 +676,11 @@ def main():
     print(f"\nTraining {args.epochs} epochs, {mode_desc}, {n_inter:,} interactions...")
 
     # Mirror LightGCN: evaluate on test periodically and report the best epoch.
+    # ``last`` keeps the final evaluation, i.e. the fixed-budget metric with no
+    # best-epoch selection bias, which is the primary number ablation studies
+    # compare (``best`` stays the headline metric for the main results table).
     best = None
+    last = None
     best_epoch = 0
     time_to_best_s = 0.0
     train_start = time.time()
@@ -515,6 +701,7 @@ def main():
 
         if ep % args.eval_every == 0 or ep == 1 or ep == args.epochs:
             rec = evaluate(model, data, te_ui, tr_ui, ks=ks)
+            last = rec
             r_primary = rec[f"recall@{primary_k}"]
             print(
                 f"  Epoch {ep:4d} | Loss: {loss_val:.4f} | "
@@ -524,7 +711,9 @@ def main():
                 hrec = {
                     "model": "gnnml3",
                     "run_id": args.run_id,
+                    "ablation": args.ablation,
                     "dataset": args.dataset,
+                    "k_core": args.k_core,
                     "seed": args.seed,
                     "epoch": ep,
                     "loss": round(loss_val, 6),
@@ -607,11 +796,26 @@ def main():
         "off_diag": args.off_diag,
         "biadj": biadj_kind,
         "amp": bool(use_amp),
+        # ablation switches (all False / default = the full model)
+        "ablation": args.ablation,
+        "learnedge": bool(args.no_learnedge is False),
+        "nout2": args.nout2,
+        "shared_head": bool(args.shared_head),
+        "drop_identity": bool(args.no_identity),
+        "drop_even": bool(args.no_even),
+        "drop_odd": bool(args.no_odd),
+        "degree_feat": bool(not args.no_degree),
+        "design_seed": design_seed,
+        "grad_checkpoint": bool(args.grad_checkpoint),
     }
     for k in ks:
         row[f"recall@{k}"] = round(best[f"recall@{k}"], 6)
         row[f"ndcg@{k}"] = round(best[f"ndcg@{k}"], 6)
         row[f"precision@{k}"] = round(best[f"precision@{k}"], 6)
+        if last is not None:
+            row[f"final_recall@{k}"] = round(last[f"recall@{k}"], 6)
+            row[f"final_ndcg@{k}"] = round(last[f"ndcg@{k}"], 6)
+            row[f"final_precision@{k}"] = round(last[f"precision@{k}"], 6)
 
     append_jsonl(args.out, row)
     print(f"\nResult appended to {args.out}")

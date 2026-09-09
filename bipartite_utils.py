@@ -168,6 +168,35 @@ def _svds_seeded(B, k, seed):
         return sp.linalg.svds(B, k=k, v0=v0)
 
 
+def _spectral_block_attr(U, rows, filt, V, cols, chunk_elems=1 << 24):
+    """Row-wise ``sum_c U[rows, c] * filt[c] * V[cols, c]``, evaluated in chunks.
+
+    The naive expression materializes a ``len(rows) x k`` temporary, which at
+    recommendation scale (millions of support edges, k in the thousands) is
+    hundreds of GB. Chunking bounds the temporaries to ``chunk_elems`` elements
+    while computing exactly the same per-row sums (same summation order), so the
+    result is numerically identical to the unchunked code.
+
+    Args:
+        U: (n_rows_total, k) singular-vector matrix (left block).
+        rows: integer array of row indices into ``U``.
+        filt: (k,) spectral filter values for one frequency band.
+        V: (n_cols_total, k) singular-vector matrix (right block); may be ``U``.
+        cols: integer array of row indices into ``V`` (same length as ``rows``).
+        chunk_elems: max elements per temporary (default 16M ~ 128 MB float64).
+    """
+    n = len(rows)
+    out = np.empty(n, dtype=np.float32)
+    if n == 0:
+        return out
+    k = max(1, U.shape[1])
+    step = max(1, int(chunk_elems) // k)
+    for s in range(0, n, step):
+        e = min(s + step, n)
+        out[s:e] = np.sum(U[rows[s:e], :] * filt * V[cols[s:e], :], axis=1)
+    return out
+
+
 # ──────────────────────────────────────────────────────────────
 #  BipartiteSpectralDesign – the core pre-transform
 # ──────────────────────────────────────────────────────────────
@@ -212,7 +241,8 @@ class BipartiteSpectralDesign(object):
 
     def __init__(self, num_users, nfreq=5, dv=5, k=100, recfield=1,
                  adddegree=True, addadj=False, nmax=0, seed=None,
-                 normalize_biadj=True, uu_topk=0, off_diag=False):
+                 normalize_biadj=True, uu_topk=0, off_diag=False,
+                 chunk_elems=1 << 24):
         self.num_users = num_users
         self.nfreq = nfreq
         self.dv = dv
@@ -225,6 +255,9 @@ class BipartiteSpectralDesign(object):
         self.normalize_biadj = normalize_biadj
         self.uu_topk = uu_topk
         self.off_diag = off_diag
+        # Cap on the elements of any temporary in the support construction
+        # (~128 MB of float64); keeps peak host RAM bounded on big graphs.
+        self.chunk_elems = chunk_elems
 
     def __call__(self, data):
         n = data.x.shape[0]
@@ -296,7 +329,12 @@ class BipartiteSpectralDesign(object):
             V = Vt.T
 
         lambda_max = S[0]
-        freqcenter = np.linspace(lambda_max/self.nfreq, lambda_max, self.nfreq)
+        # nfreq == 0 is the "no spectral bands" ablation: only the identity
+        # support survives (nsup == 1), which lets the edge network turn the
+        # conv into a plain learnable aggregation. Guard the division so that
+        # degenerate configuration is expressible.
+        freqcenter = (np.linspace(lambda_max / self.nfreq, lambda_max, self.nfreq)
+                      if self.nfreq > 0 else np.empty(0, dtype=np.float64))
 
         # ── split M into quadrants (COO) and build masks ────
         M_11 = M_sp[:num_users, :num_users].tocoo()
@@ -332,20 +370,20 @@ class BipartiteSpectralDesign(object):
 
             # UU block (even filter)
             if len(uu_row) > 0:
-                edge_attr2[is_uu, i] = np.sum(
-                    U[uu_row, :] * h_S * U[uu_col, :], axis=1)
+                edge_attr2[is_uu, i] = _spectral_block_attr(
+                    U, uu_row, h_S, U, uu_col, self.chunk_elems)
             # UV block (odd filter)
             if len(uv_row) > 0:
-                edge_attr2[is_uv, i] = np.sum(
-                    U[uv_row, :] * g_S * V[uv_col, :], axis=1)
+                edge_attr2[is_uv, i] = _spectral_block_attr(
+                    U, uv_row, g_S, V, uv_col, self.chunk_elems)
             # VU block (odd filter)
             if len(vu_row) > 0:
-                edge_attr2[is_vu, i] = np.sum(
-                    V[vu_row, :] * g_S * U[vu_col, :], axis=1)
+                edge_attr2[is_vu, i] = _spectral_block_attr(
+                    V, vu_row, g_S, U, vu_col, self.chunk_elems)
             # VV block (even filter)
             if len(vv_row) > 0:
-                edge_attr2[is_vv, i] = np.sum(
-                    V[vv_row, :] * h_S * V[vv_col, :], axis=1)
+                edge_attr2[is_vv, i] = _spectral_block_attr(
+                    V, vv_row, h_S, V, vv_col, self.chunk_elems)
 
         # ── identity support (column nfreq) ─────────────────
         diag_mask = M_coo.row == M_coo.col
