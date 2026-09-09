@@ -112,6 +112,14 @@ VARIANTS = [
          note="doubles the co-interaction receptive field (uu_topk=100); "
               "~2.3x more support edges than the baseline",
          args=["--uu-topk", "100"], seeds=[2020, 2021]),
+    dict(tag="cand_pairs", group="repair", role="addition",
+         note="augmented mask M' = A + I + P: |E_train| sampled non-edge "
+              "(candidate) pairs added to the receptive field, so the spectral "
+              "supports and the per-pair edge transform are evaluated on "
+              "unobserved pairs too "
+              "(change-ref/GNNML3_LP_CF_analysis.pdf sec. 6.1); ~1.4x more "
+              "support edges than the baseline",
+         args=["--cand-pairs", "1"], seeds=[2020, 2021]),
 ]
 
 # Flags that are part of the fixed protocol for every run in the study. Variants
@@ -382,8 +390,9 @@ def probe(args, py, out_jsonl, history_jsonl, env):
     print(f"  device: {r.get('device')}")
     # Projection: the first run of each distinct spectral config pays the design
     # build, all others load it from cache (~seconds). Distinct designs in the
-    # current matrix: baseline, no_spectral, nfreq1, dv0.5, k100, no_uu, uu100.
-    n_designs = 7
+    # current matrix: baseline, no_spectral, nfreq1, dv0.5, k100, no_uu, uu100,
+    # cand_pairs.
+    n_designs = 8
     epochs_total = n_queued * args.epochs
     est_train = epochs_total * per_ep
     est_setup = n_designs * setup + max(0, n_queued - n_designs) * 3.0

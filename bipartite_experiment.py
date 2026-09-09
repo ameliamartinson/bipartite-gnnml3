@@ -295,6 +295,20 @@ def main():
         "blocks of the receptive-field mask, giving the even spectral filters "
         "within-partition edges between consecutive user/item ids",
     )
+    p.add_argument(
+        "--cand-pairs",
+        type=float,
+        nargs="?",
+        const=1.0,
+        default=0.0,
+        metavar="R",
+        help="augmented mask M' = A + I + P: sample R * |E_train| user-item "
+        "non-edges (candidate/negative pairs) into the receptive field, so the "
+        "spectral supports and the per-pair edge transform are evaluated on "
+        "unobserved pairs too (change-ref/GNNML3_LP_CF_analysis.pdf sec. 6.1). "
+        "Bare --cand-pairs means R=1 (|P| = |E_train|); 0 disables it. P is "
+        "sampled once from --design-seed and cached with the design",
+    )
     p.add_argument("--embed-dim", type=int, default=64)
     p.add_argument(
         "--design-cache",
@@ -525,10 +539,13 @@ def main():
 
     biadj_kind = "raw" if args.raw_biadj else "normalized"
     design_seed = args.seed if args.design_seed < 0 else args.design_seed
+    # Store the resolved value so a saved checkpoint's config rebuilds the exact
+    # same design (SVD start vector and sampled candidate pairs P).
+    args.design_seed = design_seed
     print(
         f"Spectral design (nfreq={args.nfreq}, dv={args.dv}, k={args.k}, "
         f"biadj={biadj_kind}, uu_topk={args.uu_topk}, "
-        f"off_diag={args.off_diag})..."
+        f"off_diag={args.off_diag}, cand_pairs={args.cand_pairs})..."
     )
     t0 = time.time()
     # The support construction (SVD + per-edge spectral entries) depends only on
@@ -542,7 +559,7 @@ def main():
         key = "|".join(map(str, [
             args.dataset, args.k_core, nu, ni, args.nfreq, args.dv, args.k,
             args.recfield, int(not args.no_degree), biadj_kind, args.uu_topk,
-            int(args.off_diag), design_seed,
+            int(args.off_diag), args.cand_pairs, design_seed,
         ]))
         digest = hashlib.sha1(key.encode()).hexdigest()[:16]
         cache_path = os.path.join(args.design_cache, f"design_{digest}.pt")
@@ -566,6 +583,7 @@ def main():
             normalize_biadj=not args.raw_biadj,
             uu_topk=args.uu_topk,
             off_diag=args.off_diag,
+            cand_pairs=args.cand_pairs,
         )
         data = tf(data)
         if cache_path:
@@ -794,6 +812,7 @@ def main():
         "recfield": args.recfield,
         "uu_topk": args.uu_topk,
         "off_diag": args.off_diag,
+        "cand_pairs": args.cand_pairs,
         "biadj": biadj_kind,
         "amp": bool(use_amp),
         # ablation switches (all False / default = the full model)

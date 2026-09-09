@@ -9,6 +9,12 @@ separately handle within-partition and cross-partition message passing.
 
 Uses truncated SVD (sp.linalg.svds) with sparse block construction for
 efficiency on large graphs.
+
+The receptive-field mask is ``M = A + I`` by default, optionally augmented with
+sparsified within-partition co-interaction edges (``uu_topk``), a consecutive-id
+band (``off_diag``), and/or the candidate/negative pair set of the augmented
+mask ``M' = A + I + P`` (``cand_pairs``, see ``change-ref/GNNML3_LP_CF_analysis.pdf``
+sec. 6.1).
 """
 
 import numpy as np
@@ -197,6 +203,97 @@ def _spectral_block_attr(U, rows, filt, V, cols, chunk_elems=1 << 24):
     return out
 
 
+def _sample_candidate_pairs(A_sp, num_users, num_items, ratio, seed):
+    """Sample the candidate/negative pair set ``P`` of an augmented mask.
+
+    Implements the ``P`` term of the augmented receptive field
+    ``M' = A + I + P`` proposed in ``change-ref/GNNML3_LP_CF_analysis.pdf`` §6.1:
+    ``P`` is a set of user-item *non-edges* (pairs absent from the observed
+    biadjacency) drawn uniformly, with ``|P| = ratio * |E_train|``. Including
+    them in the mask makes the spectral supports non-zero on unobserved pairs,
+    so the per-pair edge transform (``mlp1..4`` / the ``learnedge`` branch) is
+    evaluated on negatives as well as on observed edges.
+
+    The pairs are sampled once, seeded by ``seed``, and returned as a symmetric
+    ``(n, n)`` binary matrix (each pair contributes both ``(u, v)`` and
+    ``(v, u)``, matching the undirected adjacency the mask is built from).
+
+    Note: the report describes ``P`` as an epoch-local object (resampled with
+    the training negatives). Rebuilding the supports every epoch is far more
+    expensive than sampling here once, so this implementation fixes ``P`` at
+    design-build time and is cached with the rest of the design; see the
+    docstring of :class:`BipartiteSpectralDesign`.
+
+    Args:
+        A_sp: (n, n) sparse binary adjacency (undirected, users first).
+        num_users: user/item split point.
+        num_items: number of item nodes.
+        ratio: pairs per training interaction (``1.0`` -> ``|P| = |E_train|``).
+        seed: RNG seed for reproducible sampling.
+
+    Returns:
+        scipy.sparse.csr_matrix of shape (n, n), binary, symmetric.
+    """
+    n = A_sp.shape[0]
+    n_target = int(round(float(ratio) * (A_sp.nnz // 2)))
+    if n_target <= 0 or num_users == 0 or num_items == 0:
+        return sp.csr_matrix((n, n), dtype=np.float32)
+
+    # Existing user->item pairs as flat keys u * num_items + i, for O(log E)
+    # membership tests while rejection-sampling non-edges.
+    A_coo = A_sp.tocoo()
+    is_u2v = (A_coo.row < num_users) & (A_coo.col >= num_users)
+    keys_existing = (A_coo.row[is_u2v].astype(np.int64) * num_items
+                     + (A_coo.col[is_u2v] - num_users))
+    keys_existing.sort()
+    n_possible = int(num_users) * int(num_items) - int(keys_existing.size)
+    if n_target > n_possible:
+        raise ValueError(
+            f"cand_pairs ratio {ratio} asks for {n_target:,} candidate pairs but "
+            f"the graph has only {n_possible:,} user-item non-edges")
+
+    rng = np.random.default_rng(seed)
+    keys = np.empty(0, dtype=np.int64)
+    rows_u = np.empty(0, dtype=np.int64)
+    rows_v = np.empty(0, dtype=np.int64)
+    while len(keys) < n_target:
+        need = n_target - len(keys)
+        # The graphs are sparse (density ~1e-3), so a 10% oversample suffices;
+        # the +64 avoids a tight loop on tiny requests.
+        draw = int(need * 1.1) + 64
+        u = rng.integers(0, num_users, size=draw).astype(np.int64)
+        v = rng.integers(0, num_items, size=draw).astype(np.int64)
+        k = u * num_items + v
+
+        # reject observed edges
+        if keys_existing.size:
+            pos = np.searchsorted(keys_existing, k)
+            np.clip(pos, 0, keys_existing.size - 1, out=pos)
+            keep = keys_existing[pos] != k
+            k, u, v = k[keep], u[keep], v[keep]
+        if k.size == 0:
+            continue
+        # deduplicate within this draw, then against everything collected
+        uniq, first = np.unique(k, return_index=True)
+        k, u, v = uniq, u[first], v[first]
+        if keys.size:
+            fresh = ~np.isin(k, keys, assume_unique=False)
+            k, u, v = k[fresh], u[fresh], v[fresh]
+        keys = np.concatenate([keys, k])
+        rows_u = np.concatenate([rows_u, u])
+        rows_v = np.concatenate([rows_v, v])
+
+    # keep exactly n_target (the last draw may overshoot)
+    rows_u, rows_v = rows_u[:n_target], rows_v[:n_target]
+    P_sp = sp.csr_matrix(
+        (np.ones(2 * n_target, dtype=np.float32),
+         (np.concatenate([rows_u, rows_v + num_users]),
+          np.concatenate([rows_v + num_users, rows_u]))),
+        shape=(n, n),
+    )
+    return P_sp
+
+
 # ──────────────────────────────────────────────────────────────
 #  BipartiteSpectralDesign – the core pre-transform
 # ──────────────────────────────────────────────────────────────
@@ -237,12 +334,20 @@ class BipartiteSpectralDesign(object):
               the UU and VV blocks of the receptive-field mask, giving the even
               spectral filters within-partition edges between consecutive user
               (item) ids.
+        cand_pairs: candidate/negative pair ratio for the augmented mask
+              ``M' = A + I + P`` (``change-ref/GNNML3_LP_CF_analysis.pdf`` §6.1).
+              ``0`` (default) keeps the plain mask ``M = A + I``; ``1.0`` samples
+              ``|E_train|`` user-item non-edges into the mask, so the spectral
+              supports and the per-pair edge transform are evaluated on
+              unobserved pairs too. ``P`` is sampled once, seeded by ``seed``,
+              and cached with the rest of the design (the report's epoch-local
+              resampling would require rebuilding the supports every epoch).
     """
 
     def __init__(self, num_users, nfreq=5, dv=5, k=100, recfield=1,
                  adddegree=True, addadj=False, nmax=0, seed=None,
                  normalize_biadj=True, uu_topk=0, off_diag=False,
-                 chunk_elems=1 << 24):
+                 cand_pairs=0.0, chunk_elems=1 << 24):
         self.num_users = num_users
         self.nfreq = nfreq
         self.dv = dv
@@ -255,6 +360,9 @@ class BipartiteSpectralDesign(object):
         self.normalize_biadj = normalize_biadj
         self.uu_topk = uu_topk
         self.off_diag = off_diag
+        # Candidate/negative pair ratio for the augmented mask M' = A + I + P
+        # (0 = off, the plain M = A + I). See _sample_candidate_pairs.
+        self.cand_pairs = float(cand_pairs)
         # Cap on the elements of any temporary in the support construction
         # (~128 MB of float64); keeps peak host RAM bounded on big graphs.
         self.chunk_elems = chunk_elems
@@ -314,6 +422,17 @@ class BipartiteSpectralDesign(object):
                   offsets=[-1, 1], shape=(num_items, num_items), format='csr')
             co_sp = sp.bmat([[off_diags_uu, None], [None, off_diags_vv]], format='csr')
             M_sp = (M_sp + co_sp).astype(bool).astype(np.float32)
+
+        # ── augmented mask M' = A + I + P (candidate pairs) ─
+        # Adds sampled user-item non-edges to the receptive field so the
+        # spectral supports (and the per-pair edge transform) are evaluated on
+        # unobserved pairs as well. These are cross-partition entries, so the
+        # odd filters g(sigma) fill their support values below, exactly like an
+        # observed edge; the identity column stays zero off the diagonal.
+        if self.cand_pairs > 0:
+            P_sp = _sample_candidate_pairs(A_sp, num_users, num_items,
+                                           self.cand_pairs, self.seed)
+            M_sp = (M_sp + P_sp).astype(bool).astype(np.float32)
 
         # ── SVD of biadjacency ──────────────────────────────
         if self.k > 0 and self.k < min(num_users, num_items):

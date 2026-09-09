@@ -20,6 +20,7 @@ Two independent measurements, neither of which trains anything:
 Usage:
     python ablation_diagnostics.py --support-stats --off-diag
     python ablation_diagnostics.py --support-stats --uu-topk 30 --out /tmp/s.json
+    python ablation_diagnostics.py --support-stats --uu-topk 30 --cand-pairs 1
     python ablation_diagnostics.py --checkpoint results/ablations/baseline_s2020.pt
 """
 
@@ -83,30 +84,45 @@ def support_stats(args):
         nu, nfreq=args.nfreq, dv=args.dv, k=args.k, recfield=args.recfield,
         adddegree=True, nmax=0, seed=args.seed,
         normalize_biadj=not args.raw_biadj, uu_topk=args.uu_topk,
-        off_diag=args.off_diag)
+        off_diag=args.off_diag, cand_pairs=args.cand_pairs)
     data = tf(data)
 
     ea = data.edge_attr2
     ei = data.edge_index2
     n_edges = ea.shape[0]
-    is_user = ei[0] < nu
-    col_user = ei[1] < nu
+    is_user = (ei[0] < nu).numpy()
+    col_user = (ei[1] < nu).numpy()
     block = np.where(is_user & col_user, "UU",
                      np.where(is_user & ~col_user, "UV",
                               np.where(~is_user & col_user, "VU", "VV")))
     identity_col = args.nfreq
+
+    # Mark which cross-partition support entries are actual observed edges vs
+    # candidate (non-edge) pairs contributed by the augmented mask A + I + P.
+    obs = data.edge_index[0].numpy().astype(np.int64) * (nu + ni) \
+        + data.edge_index[1].numpy().astype(np.int64)
+    obs = np.unique(obs)
+    here = ei[0].numpy().astype(np.int64) * (nu + ni) + ei[1].numpy().astype(np.int64)
+    pos = np.searchsorted(obs, here)
+    np.clip(pos, 0, obs.size - 1, out=pos)
+    is_observed = obs[pos] == here
 
     out = {
         "config": dict(dataset=args.dataset, k_core=args.k_core, nu=nu, ni=ni,
                        n_support_edges=int(n_edges), nfreq=args.nfreq,
                        dv=args.dv, k_svd=args.k, recfield=args.recfield,
                        uu_topk=args.uu_topk, off_diag=bool(args.off_diag),
+                       cand_pairs=float(args.cand_pairs),
                        biadj="raw" if args.raw_biadj else "normalized"),
         "blocks": {},
         "columns": [],
     }
     for b in ("UU", "UV", "VU", "VV"):
         m = block == b
+        # P is defined on user-item non-edges, so only cross-partition entries
+        # can be candidate pairs; UU/VV mask entries (diagonal, co-interaction
+        # edges) are not "non-edges" in that sense.
+        cand = m & ~is_observed & (is_user != col_user)
         out["blocks"][b] = dict(
             n_edges=int(m.sum()),
             frac_of_support=round(float(m.mean()), 6),
@@ -117,6 +133,10 @@ def support_stats(args):
             mean_abs_band=round(float(ea[m, :identity_col].abs().mean())
                                 if m.sum() else 0.0, 6),
             identity_nonzero=int((ea[m, identity_col] != 0).sum()),
+            n_candidate_pairs=int(cand.sum()),
+            mean_abs_band_candidate=round(
+                float(ea[cand, :identity_col].abs().mean())
+                if cand.sum() else 0.0, 6),
         )
     for j in range(ea.shape[1]):
         col = ea[:, j]
@@ -132,13 +152,17 @@ def support_stats(args):
 
     print(f"\nSupport statistics for {args.dataset} (k-core {args.k_core}): "
           f"{nu} users, {ni} items, {n_edges:,} support edges")
-    print(f"  supports: {args.nfreq} bands + identity")
+    print(f"  supports: {args.nfreq} bands + identity"
+          f" | cand_pairs={args.cand_pairs} (M' = A + I + P)")
     print(f"  {'block':6s} {'#edges':>10s} {'%ofsup':>8s} {'band nz':>10s} "
-          f"{'band nz%':>9s} {'mean|band|':>11s} {'ident nz':>9s}")
+          f"{'band nz%':>9s} {'mean|band|':>11s} {'ident nz':>9s} "
+          f"{'#cand':>10s} {'mean|cand|':>11s}")
     for b, s in out["blocks"].items():
         print(f"  {b:6s} {s['n_edges']:10,d} {100*s['frac_of_support']:7.2f}% "
               f"{s['n_band_nonzero']:10,d} {100*s['frac_band_nonzero']:8.2f}% "
-              f"{s['mean_abs_band']:11.5f} {s['identity_nonzero']:9,d}")
+              f"{s['mean_abs_band']:11.5f} {s['identity_nonzero']:9,d} "
+              f"{s['n_candidate_pairs']:10,d} "
+              f"{s['mean_abs_band_candidate']:11.5f}")
     print(f"  {'column':>8s} {'kind':>10s} {'#nonzero':>10s} {'%':>7s} "
           f"{'mean|.|':>9s} {'max|.|':>9s}")
     for c in out["columns"]:
@@ -155,13 +179,21 @@ def inference_sensitivity(args):
     k_core = cfg.get("k_core", args.k_core)
     tr_e, te_e, nu, ni = load_split(dataset, k_core)
     data = build_data(tr_e, nu, ni)
+    # Rebuild the *exact* design the checkpoint was trained with: the design
+    # seed (not the training seed) drives the truncated-SVD start vector and the
+    # sampled candidate pairs P, so using the wrong one would evaluate the model
+    # on a different mask.
+    design_seed = cfg.get("design_seed", -1)
+    if design_seed is None or design_seed < 0:
+        design_seed = cfg.get("seed", 2020)
     tf = BipartiteSpectralDesign(
         nu, nfreq=cfg.get("nfreq", 5), dv=cfg.get("dv", 5),
         k=cfg.get("k", 100), recfield=cfg.get("recfield", 1),
         adddegree=not cfg.get("no_degree", False), nmax=0,
-        seed=cfg.get("seed", 2020),
+        seed=design_seed,
         normalize_biadj=not cfg.get("raw_biadj", False),
-        uu_topk=cfg.get("uu_topk", 0), off_diag=cfg.get("off_diag", False))
+        uu_topk=cfg.get("uu_topk", 0), off_diag=cfg.get("off_diag", False),
+        cand_pairs=cfg.get("cand_pairs", 0.0))
     data = tf(data)
     tr_ui, te_ui = {}, {}
     for u, i in tr_e:
@@ -224,6 +256,10 @@ def main():
     ap.add_argument("--recfield", type=int, default=1)
     ap.add_argument("--uu-topk", type=int, default=0)
     ap.add_argument("--off-diag", action="store_true")
+    ap.add_argument("--cand-pairs", type=float, nargs="?", const=1.0,
+                    default=0.0, metavar="R",
+                    help="augmented mask M' = A + I + P: sample R * |E_train| "
+                    "user-item non-edges into the receptive field (0 = off)")
     ap.add_argument("--raw-biadj", action="store_true")
     ap.add_argument("--seed", type=int, default=2020)
     ap.add_argument("--support-stats", action="store_true")
