@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import sys
+import warnings
 
 import numpy as np
 import torch
@@ -77,6 +78,29 @@ def build_data(tr_e, nu, ni):
     return Data(edge_index=ei, x=x, y=torch.tensor([0]))
 
 
+def offdiag_zero_descriptor_fraction(edge_index2, edge_attr2):
+    """Fraction of off-diagonal support rows whose descriptor is all zeros.
+
+    The descriptor of a support entry is the row of ``edge_attr2`` that
+    ``ML3Layer``'s edge network consumes (``nsup`` values: the spectral bands,
+    the identity support, and optionally the adjacency support). Every ML3 edge
+    MLP is bias-free, so a zero descriptor gives ``F(0) = 0`` and a zero message
+    weight. A fraction of 1.0 therefore means no message passing happens at all
+    on off-diagonal entries -- exactly the degeneracy of ``--nfreq 0`` (whose
+    only column is the identity, zero everywhere off the diagonal).
+    """
+    ei = edge_index2 if isinstance(edge_index2, torch.Tensor) \
+        else torch.as_tensor(edge_index2)
+    ea = edge_attr2 if isinstance(edge_attr2, torch.Tensor) \
+        else torch.as_tensor(edge_attr2)
+    offdiag = ei[0] != ei[1]
+    n_offdiag = int(offdiag.sum())
+    if n_offdiag == 0:
+        return 0.0
+    zero = ea.abs().sum(dim=1) == 0
+    return float((offdiag & zero).sum()) / n_offdiag
+
+
 def support_stats(args):
     tr_e, _, nu, ni = load_split(args.dataset, args.k_core)
     data = build_data(tr_e, nu, ni)
@@ -84,7 +108,8 @@ def support_stats(args):
         nu, nfreq=args.nfreq, dv=args.dv, k=args.k, recfield=args.recfield,
         adddegree=True, nmax=0, seed=args.seed,
         normalize_biadj=not args.raw_biadj, uu_topk=args.uu_topk,
-        off_diag=args.off_diag, cand_pairs=args.cand_pairs)
+        off_diag=args.off_diag, cand_pairs=args.cand_pairs,
+        flat_support=args.flat_support, shuffle_bands=args.shuffle_bands)
     data = tf(data)
 
     ea = data.edge_attr2
@@ -113,10 +138,16 @@ def support_stats(args):
                        dv=args.dv, k_svd=args.k, recfield=args.recfield,
                        uu_topk=args.uu_topk, off_diag=bool(args.off_diag),
                        cand_pairs=float(args.cand_pairs),
+                       flat_support=bool(args.flat_support),
+                       shuffle_bands=bool(args.shuffle_bands),
                        biadj="raw" if args.raw_biadj else "normalized"),
         "blocks": {},
         "columns": [],
     }
+    # Degeneracy check: with nfreq=0 every off-diagonal descriptor is zero, so
+    # (bias-free edge MLPs => F(0)=0) no message passes. See the helper.
+    out["offdiag_zero_descriptor_fraction"] = round(
+        offdiag_zero_descriptor_fraction(ei, ea), 6)
     for b in ("UU", "UV", "VU", "VV"):
         m = block == b
         # P is defined on user-item non-edges, so only cross-partition entries
@@ -153,7 +184,9 @@ def support_stats(args):
     print(f"\nSupport statistics for {args.dataset} (k-core {args.k_core}): "
           f"{nu} users, {ni} items, {n_edges:,} support edges")
     print(f"  supports: {args.nfreq} bands + identity"
-          f" | cand_pairs={args.cand_pairs} (M' = A + I + P)")
+          f" | cand_pairs={args.cand_pairs} (M' = A + I + P)"
+          f" | flat_support={args.flat_support}"
+          f" | shuffle_bands={args.shuffle_bands}")
     print(f"  {'block':6s} {'#edges':>10s} {'%ofsup':>8s} {'band nz':>10s} "
           f"{'band nz%':>9s} {'mean|band|':>11s} {'ident nz':>9s} "
           f"{'#cand':>10s} {'mean|cand|':>11s}")
@@ -169,6 +202,22 @@ def support_stats(args):
         print(f"  {c['index']:8d} {c['kind']:>10s} {c['n_nonzero']:10,d} "
               f"{100*c['frac_nonzero']:6.2f}% {c['mean_abs']:9.5f} "
               f"{c['max_abs']:9.5f}")
+
+    frac_zero = out["offdiag_zero_descriptor_fraction"]
+    print(f"  off-diagonal support rows with an all-zero descriptor: "
+          f"{100 * frac_zero:.2f}%")
+    if frac_zero > 0:
+        msg = (
+            f"DEGENERATE DESIGN: {100 * frac_zero:.2f}% of off-diagonal support "
+            f"rows have an all-zero edge descriptor (nfreq={args.nfreq}, "
+            f"flat_support={args.flat_support}, shuffle_bands="
+            f"{args.shuffle_bands}). The ML3 edge MLPs are bias-free, so F(0)=0 "
+            f"and those edges carry zero message weight: this configuration "
+            f"removes message passing rather than ablating spectral selectivity.")
+        print("\n" + "!" * 78)
+        print("!! WARNING: " + msg)
+        print("!" * 78 + "\n")
+        warnings.warn(msg, stacklevel=2)
     return out
 
 
@@ -193,7 +242,9 @@ def inference_sensitivity(args):
         seed=design_seed,
         normalize_biadj=not cfg.get("raw_biadj", False),
         uu_topk=cfg.get("uu_topk", 0), off_diag=cfg.get("off_diag", False),
-        cand_pairs=cfg.get("cand_pairs", 0.0))
+        cand_pairs=cfg.get("cand_pairs", 0.0),
+        flat_support=cfg.get("flat_support", False),
+        shuffle_bands=cfg.get("shuffle_bands", False))
     data = tf(data)
     tr_ui, te_ui = {}, {}
     for u, i in tr_e:
@@ -260,6 +311,13 @@ def main():
                     default=0.0, metavar="R",
                     help="augmented mask M' = A + I + P: sample R * |E_train| "
                     "user-item non-edges into the receptive field (0 = off)")
+    ap.add_argument("--flat-support", action="store_true",
+                    help="spectral-selectivity control: every band column is "
+                    "the constant 1.0 (no-op with --nfreq 0)")
+    ap.add_argument("--shuffle-bands", action="store_true",
+                    help="spectral-selectivity control: filters evaluated at a "
+                    "seeded permutation of the singular values (no-op with "
+                    "--nfreq 0)")
     ap.add_argument("--raw-biadj", action="store_true")
     ap.add_argument("--seed", type=int, default=2020)
     ap.add_argument("--support-stats", action="store_true")

@@ -17,6 +17,8 @@ mask ``M' = A + I + P`` (``cand_pairs``, see ``change-ref/GNNML3_LP_CF_analysis.
 sec. 6.1).
 """
 
+import warnings
+
 import numpy as np
 import scipy.sparse as sp
 import torch
@@ -342,12 +344,26 @@ class BipartiteSpectralDesign(object):
               unobserved pairs too. ``P`` is sampled once, seeded by ``seed``,
               and cached with the rest of the design (the report's epoch-local
               resampling would require rebuilding the supports every epoch).
+        flat_support: if True, overwrite every spectral band column with the
+              constant ``1.0`` so all support entries are indistinguishable to
+              the edge network (which then emits one weight vector per support:
+              a plain learned-weight aggregation). A constant non-zero value,
+              not zero, because the ML3 edge MLPs are bias-free and ``F(0) = 0``
+              would silence message passing entirely. ``nsup``, the support
+              graph, the identity column and the ``addadj`` column are unchanged.
+        shuffle_bands: if True, evaluate the band filters ``h``/``g`` at a
+              seeded permutation of the singular values
+              (``edge_attr2[e, s] = sum_c U[u,c] g(sigma_{pi(c)}; f_s) V[i,c]``),
+              destroying the frequency correspondence while keeping ``U``, ``V``,
+              the support graph and the multiset of filter values. Both this and
+              ``flat_support`` are no-ops when ``nfreq == 0`` (warned).
     """
 
     def __init__(self, num_users, nfreq=5, dv=5, k=100, recfield=1,
                  adddegree=True, addadj=False, nmax=0, seed=None,
                  normalize_biadj=True, uu_topk=0, off_diag=False,
-                 cand_pairs=0.0, chunk_elems=1 << 24):
+                 cand_pairs=0.0, flat_support=False, shuffle_bands=False,
+                 chunk_elems=1 << 24):
         self.num_users = num_users
         self.nfreq = nfreq
         self.dv = dv
@@ -363,6 +379,12 @@ class BipartiteSpectralDesign(object):
         # Candidate/negative pair ratio for the augmented mask M' = A + I + P
         # (0 = off, the plain M = A + I). See _sample_candidate_pairs.
         self.cand_pairs = float(cand_pairs)
+        # Spectral-selectivity controls (both no-ops when nfreq == 0):
+        # flat_support writes a constant non-zero descriptor into the band
+        # columns; shuffle_bands evaluates the filters at a permutation of the
+        # singular values, destroying the frequency correspondence.
+        self.flat_support = bool(flat_support)
+        self.shuffle_bands = bool(shuffle_bands)
         # Cap on the elements of any temporary in the support construction
         # (~128 MB of float64); keeps peak host RAM bounded on big graphs.
         self.chunk_elems = chunk_elems
@@ -455,6 +477,25 @@ class BipartiteSpectralDesign(object):
         freqcenter = (np.linspace(lambda_max / self.nfreq, lambda_max, self.nfreq)
                       if self.nfreq > 0 else np.empty(0, dtype=np.float64))
 
+        # Both spectral-selectivity controls act on the band columns, which do
+        # not exist at nfreq == 0; say so loudly rather than silently no-op.
+        if self.nfreq == 0 and (self.flat_support or self.shuffle_bands):
+            flags = ", ".join(f for f, on in
+                              (("--flat-support", self.flat_support),
+                               ("--shuffle-bands", self.shuffle_bands)) if on)
+            warnings.warn(
+                f"{flags} with --nfreq 0 is a no-op: there are no spectral band "
+                f"columns to modify (the only support is the identity)",
+                stacklevel=2)
+
+        # --shuffle-bands: keep U, V and the multiset of filter values but break
+        # the frequency correspondence, by evaluating h/g at sigma_{pi(c)} in
+        # place of sigma_c.
+        S_filt = S
+        if self.shuffle_bands and self.nfreq > 0:
+            perm = np.random.default_rng(self.seed).permutation(len(S))
+            S_filt = S[perm]
+
         # ── split M into quadrants (COO) and build masks ────
         M_11 = M_sp[:num_users, :num_users].tocoo()
         M_12 = M_sp[:num_users, num_users:].tocoo()
@@ -484,8 +525,8 @@ class BipartiteSpectralDesign(object):
         vv_col = M_coo.col[is_vv] - num_users
 
         for i, f_s in enumerate(freqcenter):
-            h_S = h(S, b=self.dv, f_s=f_s)
-            g_S = g(S, b=self.dv, f_s=f_s)
+            h_S = h(S_filt, b=self.dv, f_s=f_s)
+            g_S = g(S_filt, b=self.dv, f_s=f_s)
 
             # UU block (even filter)
             if len(uu_row) > 0:
@@ -503,6 +544,15 @@ class BipartiteSpectralDesign(object):
             if len(vv_row) > 0:
                 edge_attr2[is_vv, i] = _spectral_block_attr(
                     V, vv_row, h_S, V, vv_col, self.chunk_elems)
+
+        # ── --flat-support: constant non-zero descriptor on every band ──────
+        # Every support entry gets the same band vector, so the edge network
+        # emits a single weight per support and the layer degenerates to a plain
+        # learned-weight aggregation -- the "no spectral selectivity" reference.
+        # Constant 1.0, not 0.0: the edge MLPs are bias-free, so F(0) = 0 would
+        # zero every message weight and remove message passing entirely.
+        if self.flat_support and self.nfreq > 0:
+            edge_attr2[:, :self.nfreq] = 1.0
 
         # ── identity support (column nfreq) ─────────────────
         diag_mask = M_coo.row == M_coo.col

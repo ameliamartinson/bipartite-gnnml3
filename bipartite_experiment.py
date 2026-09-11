@@ -309,6 +309,26 @@ def main():
         "Bare --cand-pairs means R=1 (|P| = |E_train|); 0 disables it. P is "
         "sampled once from --design-seed and cached with the design",
     )
+    p.add_argument(
+        "--flat-support",
+        action="store_true",
+        help="spectral-selectivity control: overwrite every spectral band column "
+        "of edge_attr2 with the constant 1.0, so all support entries are "
+        "indistinguishable to the edge network and the layer degenerates to a "
+        "plain learned-weight aggregation (same nsup/parameter count as the "
+        "baseline). Constant 1.0, not 0.0: the edge MLPs are bias-free, so 0 "
+        "would silence message passing entirely. No-op with --nfreq 0",
+    )
+    p.add_argument(
+        "--shuffle-bands",
+        action="store_true",
+        help="spectral-selectivity control: evaluate the band filters at a seeded "
+        "permutation of the singular values "
+        "(edge_attr2[e,s] = sum_c U[u,c] g(sigma_pi(c); f_s) V[i,c]), destroying "
+        "the frequency correspondence while keeping U, V, the support graph and "
+        "the multiset of filter values. The permutation comes from "
+        "--design-seed. No-op with --nfreq 0",
+    )
     p.add_argument("--embed-dim", type=int, default=64)
     p.add_argument(
         "--design-cache",
@@ -545,7 +565,9 @@ def main():
     print(
         f"Spectral design (nfreq={args.nfreq}, dv={args.dv}, k={args.k}, "
         f"biadj={biadj_kind}, uu_topk={args.uu_topk}, "
-        f"off_diag={args.off_diag}, cand_pairs={args.cand_pairs})..."
+        f"off_diag={args.off_diag}, cand_pairs={args.cand_pairs}, "
+        f"flat_support={args.flat_support}, "
+        f"shuffle_bands={args.shuffle_bands})..."
     )
     t0 = time.time()
     # The support construction (SVD + per-edge spectral entries) depends only on
@@ -559,7 +581,8 @@ def main():
         key = "|".join(map(str, [
             args.dataset, args.k_core, nu, ni, args.nfreq, args.dv, args.k,
             args.recfield, int(not args.no_degree), biadj_kind, args.uu_topk,
-            int(args.off_diag), args.cand_pairs, design_seed,
+            int(args.off_diag), args.cand_pairs,
+            int(args.flat_support), int(args.shuffle_bands), design_seed,
         ]))
         digest = hashlib.sha1(key.encode()).hexdigest()[:16]
         cache_path = os.path.join(args.design_cache, f"design_{digest}.pt")
@@ -584,6 +607,8 @@ def main():
             uu_topk=args.uu_topk,
             off_diag=args.off_diag,
             cand_pairs=args.cand_pairs,
+            flat_support=args.flat_support,
+            shuffle_bands=args.shuffle_bands,
         )
         data = tf(data)
         if cache_path:
@@ -813,6 +838,8 @@ def main():
         "uu_topk": args.uu_topk,
         "off_diag": args.off_diag,
         "cand_pairs": args.cand_pairs,
+        "flat_support": bool(args.flat_support),
+        "shuffle_bands": bool(args.shuffle_bands),
         "biadj": biadj_kind,
         "amp": bool(use_amp),
         # ablation switches (all False / default = the full model)

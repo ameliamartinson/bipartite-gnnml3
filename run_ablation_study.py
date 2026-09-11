@@ -56,8 +56,12 @@ VARIANTS = [
          note="multiplicative tanh*tanh gating branch removed (nout2=0)",
          args=["--nout2", "0"]),
     dict(tag="no_spectral", group="gnnml3", role="ablation",
-         note="all Gaussian spectral bands removed (nfreq=0); only the identity "
-              "support remains, so the conv is a learned aggregation",
+         note="all spectral band columns removed (nfreq=0): the only support is "
+              "the identity, so every off-diagonal descriptor is exactly zero "
+              "and, because the ML3 edge MLPs are bias-free (F(0)=0), every "
+              "message weight is zero too -- this removes message passing "
+              "entirely (a graph-free ablation), it is not a 'no spectral "
+              "selectivity' control; see flat_support/shuffled_bands",
          args=["--nfreq", "0"]),
     dict(tag="no_identity", group="gnnml3", role="ablation",
          note="identity support zeroed (no self-connection in the conv)",
@@ -106,6 +110,20 @@ VARIANTS = [
          note="sparsified within-partition co-interaction edges removed "
               "(uu_topk=0): the even filters see only the identity diagonal",
          args=["--uu-topk-off"], seeds=[2020, 2021]),
+    dict(tag="flat_support", group="spectral", role="ablation",
+         note="every spectral band column overwritten with the constant 1.0: all "
+              "support entries are indistinguishable to the edge network, so the "
+              "layer is a plain learned-weight aggregation with the baseline's "
+              "nsup and parameter count (the proper 'no spectral selectivity' "
+              "control that --nfreq 0 was meant to be)",
+         args=["--flat-support"]),
+    dict(tag="shuffled_bands", group="spectral", role="ablation",
+         note="band filters evaluated at a seeded permutation of the singular "
+              "values: the frequency correspondence is destroyed while U, V, the "
+              "support graph and the multiset of filter values are kept (if this "
+              "matches the baseline while flat_support does not, the bands act as "
+              "random features rather than as filters)",
+         args=["--shuffle-bands"]),
 
     # ── addition probes (not leave-one-out) ──────────────────────────────
     dict(tag="uu100", group="addition", role="addition",
@@ -391,8 +409,8 @@ def probe(args, py, out_jsonl, history_jsonl, env):
     # Projection: the first run of each distinct spectral config pays the design
     # build, all others load it from cache (~seconds). Distinct designs in the
     # current matrix: baseline, no_spectral, nfreq1, dv0.5, k100, no_uu, uu100,
-    # cand_pairs.
-    n_designs = 8
+    # cand_pairs, flat_support, shuffled_bands.
+    n_designs = 10
     epochs_total = n_queued * args.epochs
     est_train = epochs_total * per_ep
     est_setup = n_designs * setup + max(0, n_queued - n_designs) * 3.0
