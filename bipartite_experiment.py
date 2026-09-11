@@ -320,6 +320,17 @@ def main():
         "would silence message passing entirely. No-op with --nfreq 0",
     )
     p.add_argument(
+        "--flat-support-value",
+        type=float,
+        default=1.0,
+        metavar="C",
+        help="constant written into the spectral band columns by --flat-support "
+        "(default 1.0). The real spectral descriptors are ~1e-3 in magnitude, so "
+        "1.0 also scales the messages up by ~500x; pass the mean |band| value "
+        "(printed by ablation_diagnostics.py --support-stats) for a "
+        "scale-matched no-selectivity control",
+    )
+    p.add_argument(
         "--shuffle-bands",
         action="store_true",
         help="spectral-selectivity control: evaluate the band filters at a seeded "
@@ -566,7 +577,8 @@ def main():
         f"Spectral design (nfreq={args.nfreq}, dv={args.dv}, k={args.k}, "
         f"biadj={biadj_kind}, uu_topk={args.uu_topk}, "
         f"off_diag={args.off_diag}, cand_pairs={args.cand_pairs}, "
-        f"flat_support={args.flat_support}, "
+        f"flat_support={args.flat_support}"
+        f"(value={args.flat_support_value}), "
         f"shuffle_bands={args.shuffle_bands})..."
     )
     t0 = time.time()
@@ -582,7 +594,8 @@ def main():
             args.dataset, args.k_core, nu, ni, args.nfreq, args.dv, args.k,
             args.recfield, int(not args.no_degree), biadj_kind, args.uu_topk,
             int(args.off_diag), args.cand_pairs,
-            int(args.flat_support), int(args.shuffle_bands), design_seed,
+            int(args.flat_support), args.flat_support_value,
+            int(args.shuffle_bands), design_seed,
         ]))
         digest = hashlib.sha1(key.encode()).hexdigest()[:16]
         cache_path = os.path.join(args.design_cache, f"design_{digest}.pt")
@@ -608,6 +621,7 @@ def main():
             off_diag=args.off_diag,
             cand_pairs=args.cand_pairs,
             flat_support=args.flat_support,
+            flat_support_value=args.flat_support_value,
             shuffle_bands=args.shuffle_bands,
         )
         data = tf(data)
@@ -839,6 +853,7 @@ def main():
         "off_diag": args.off_diag,
         "cand_pairs": args.cand_pairs,
         "flat_support": bool(args.flat_support),
+        "flat_support_value": args.flat_support_value,
         "shuffle_bands": bool(args.shuffle_bands),
         "biadj": biadj_kind,
         "amp": bool(use_amp),

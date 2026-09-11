@@ -345,12 +345,16 @@ class BipartiteSpectralDesign(object):
               and cached with the rest of the design (the report's epoch-local
               resampling would require rebuilding the supports every epoch).
         flat_support: if True, overwrite every spectral band column with the
-              constant ``1.0`` so all support entries are indistinguishable to
-              the edge network (which then emits one weight vector per support:
-              a plain learned-weight aggregation). A constant non-zero value,
-              not zero, because the ML3 edge MLPs are bias-free and ``F(0) = 0``
-              would silence message passing entirely. ``nsup``, the support
-              graph, the identity column and the ``addadj`` column are unchanged.
+              constant value, not zero, because the ML3 edge MLPs are bias-free
+              and ``F(0) = 0`` would silence message passing entirely. ``nsup``,
+              the support graph, the identity column and the ``addadj`` column are
+              unchanged.
+        flat_support_value: the constant written into the band columns when
+              ``flat_support`` is on (default ``1.0``). The spectral descriptors
+              are small (mean ``|g(sigma)|`` ~ ``1e-3`` on these graphs), so
+              ``1.0`` also multiplies the message scale by ~500x; pass the
+              measured mean to get a *scale-matched* no-selectivity control that
+              isolates the loss of selectivity from the change in magnitude.
         shuffle_bands: if True, evaluate the band filters ``h``/``g`` at a
               seeded permutation of the singular values
               (``edge_attr2[e, s] = sum_c U[u,c] g(sigma_{pi(c)}; f_s) V[i,c]``),
@@ -362,8 +366,8 @@ class BipartiteSpectralDesign(object):
     def __init__(self, num_users, nfreq=5, dv=5, k=100, recfield=1,
                  adddegree=True, addadj=False, nmax=0, seed=None,
                  normalize_biadj=True, uu_topk=0, off_diag=False,
-                 cand_pairs=0.0, flat_support=False, shuffle_bands=False,
-                 chunk_elems=1 << 24):
+                 cand_pairs=0.0, flat_support=False, flat_support_value=1.0,
+                 shuffle_bands=False, chunk_elems=1 << 24):
         self.num_users = num_users
         self.nfreq = nfreq
         self.dv = dv
@@ -384,6 +388,7 @@ class BipartiteSpectralDesign(object):
         # columns; shuffle_bands evaluates the filters at a permutation of the
         # singular values, destroying the frequency correspondence.
         self.flat_support = bool(flat_support)
+        self.flat_support_value = float(flat_support_value)
         self.shuffle_bands = bool(shuffle_bands)
         # Cap on the elements of any temporary in the support construction
         # (~128 MB of float64); keeps peak host RAM bounded on big graphs.
@@ -487,6 +492,10 @@ class BipartiteSpectralDesign(object):
                 f"{flags} with --nfreq 0 is a no-op: there are no spectral band "
                 f"columns to modify (the only support is the identity)",
                 stacklevel=2)
+        if not self.flat_support and self.flat_support_value != 1.0:
+            warnings.warn(
+                "flat_support_value has no effect without flat_support=True",
+                stacklevel=2)
 
         # --shuffle-bands: keep U, V and the multiset of filter values but break
         # the frequency correspondence, by evaluating h/g at sigma_{pi(c)} in
@@ -549,10 +558,12 @@ class BipartiteSpectralDesign(object):
         # Every support entry gets the same band vector, so the edge network
         # emits a single weight per support and the layer degenerates to a plain
         # learned-weight aggregation -- the "no spectral selectivity" reference.
-        # Constant 1.0, not 0.0: the edge MLPs are bias-free, so F(0) = 0 would
-        # zero every message weight and remove message passing entirely.
+        # The constant is 1.0 by default, not 0.0: the edge MLPs are bias-free,
+        # so F(0) = 0 would zero every message weight and remove message passing
+        # entirely. Pass flat_support_value = mean|band| for a scale-matched
+        # control that does not also change the message magnitude.
         if self.flat_support and self.nfreq > 0:
-            edge_attr2[:, :self.nfreq] = 1.0
+            edge_attr2[:, :self.nfreq] = self.flat_support_value
 
         # ── identity support (column nfreq) ─────────────────
         diag_mask = M_coo.row == M_coo.col

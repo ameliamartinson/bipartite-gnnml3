@@ -109,7 +109,9 @@ def support_stats(args):
         adddegree=True, nmax=0, seed=args.seed,
         normalize_biadj=not args.raw_biadj, uu_topk=args.uu_topk,
         off_diag=args.off_diag, cand_pairs=args.cand_pairs,
-        flat_support=args.flat_support, shuffle_bands=args.shuffle_bands)
+        flat_support=args.flat_support,
+        flat_support_value=args.flat_support_value,
+        shuffle_bands=args.shuffle_bands)
     data = tf(data)
 
     ea = data.edge_attr2
@@ -203,6 +205,16 @@ def support_stats(args):
               f"{100*c['frac_nonzero']:6.2f}% {c['mean_abs']:9.5f} "
               f"{c['max_abs']:9.5f}")
 
+    if args.nfreq > 0:
+        band_abs = ea[:, :args.nfreq].abs()
+        cross = is_user != col_user
+        suggest = float(band_abs[cross].mean()) if cross.any() \
+            else float(band_abs.mean())
+        out["suggested_flat_support_value"] = round(suggest, 8)
+        print(f"  suggested --flat-support-value (mean |band| on cross-partition "
+              f"edges): {suggest:.6f}   [overall mean |band|: "
+              f"{float(band_abs.mean()):.6f}]")
+
     frac_zero = out["offdiag_zero_descriptor_fraction"]
     print(f"  off-diagonal support rows with an all-zero descriptor: "
           f"{100 * frac_zero:.2f}%")
@@ -244,6 +256,7 @@ def inference_sensitivity(args):
         uu_topk=cfg.get("uu_topk", 0), off_diag=cfg.get("off_diag", False),
         cand_pairs=cfg.get("cand_pairs", 0.0),
         flat_support=cfg.get("flat_support", False),
+        flat_support_value=cfg.get("flat_support_value", 1.0),
         shuffle_bands=cfg.get("shuffle_bands", False))
     data = tf(data)
     tr_ui, te_ui = {}, {}
@@ -314,6 +327,10 @@ def main():
     ap.add_argument("--flat-support", action="store_true",
                     help="spectral-selectivity control: every band column is "
                     "the constant 1.0 (no-op with --nfreq 0)")
+    ap.add_argument("--flat-support-value", type=float, default=1.0,
+                    metavar="C",
+                    help="constant written into the band columns by "
+                    "--flat-support (default 1.0)")
     ap.add_argument("--shuffle-bands", action="store_true",
                     help="spectral-selectivity control: filters evaluated at a "
                     "seeded permutation of the singular values (no-op with "
